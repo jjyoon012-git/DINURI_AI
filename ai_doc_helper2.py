@@ -151,12 +151,61 @@ def guess_doc_type(text: str) -> str:
             best, score = dtype, s
     return best
 
+# Update(25-10-28): Hallucination guard
+def is_low_info(text: str, tags: Dict[str, List[str]]) -> bool:
+    # 길이가 매우 짧거나, 숫자/한글이 거의 없거나, 태그가 비어 있으면 정보부족으로 판단
+    t = (text or "").strip()
+    if len(t) < 25:
+        return True
+    # 의미있는 한글/숫자 토큰 개수 기준
+    tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", t)
+    return len(tokens) < 10 and len(tags) == 0
 
+# Update(25-10-28): Schedule extraction 
+TIME_PAT = re.compile(r"(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?\s*(~|-|부터)\s*(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?")
+TIME_SIMPLE = re.compile(r"(오전|오후)?\s*\d{1,2}\s*(~|-)\s*(오전|오후)?\s*\d{1,2}\s*")
+DATE_PATS = [
+    re.compile(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}"),
+    re.compile(r"\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일"),
+    re.compile(r"\d{1,2}\s*월\s*\d{1,2}\s*일"),
+]
+
+def extract_schedule(text: str) -> Dict[str, Optional[str]]:
+    title = None
+    date_hits: List[str] = []
+    time_hits: List[str] = []
+    # 날짜
+    for p in DATE_PATS:
+        date_hits += p.findall(text or "")
+    # 시간
+    time_hits += TIME_PAT.findall(text or "")
+    if not time_hits:
+        time_hits += TIME_SIMPLE.findall(text or "")
+    # 타이틀 후보: 회의/세미나/행사/일정/미팅/발표 등 포함된 첫 줄
+    for line in (text or "").splitlines():
+        if any(k in line for k in ["회의", "세미나", "행사", "일정", "미팅", "발표", "시연", "면접", "수업", "강의", "오리엔테이션"]):
+            title = line.strip()
+            break
+    # 정리
+    date_range = " ~ ".join(date_hits[:2]) if date_hits else ""
+    # 시간 정규식 튜플을 문자열로 정리
+    def _norm_time(hit):
+        if isinstance(hit, tuple):
+            return "".join([h for h in hit if isinstance(h, str)])
+        return hit
+    time_range = " ~ ".join([_norm_time(h) for h in time_hits[:2]]) if time_hits else ""
+    return {
+        "title": (title or "")[:120],
+        "date_range": date_range,
+        "time_range": time_range,
+    }
+    
 # LLM Prompting
 # 요약 및 행동 안내 생성
 PROMPT_TEMPLATE = """
 당신은 한국어 'AI 문서 해설사'입니다.
 입력 문서를 어르신이 이해하기 쉽게 요약(핵심,행동안내)으로 변환하세요.
+정보가 부족하면 요약을 만들지 말고, 사용자에게 물어볼 질문을 제안하세요.
 귀여운 손주가 존댓말로 친근하게 설명합니다.
 
 문서 유형: {doc_type}
@@ -167,6 +216,8 @@ PROMPT_TEMPLATE = """
 {{
   "bullets": ["핵심 3~5가지 요약"],
   "next_actions": ["지금 해야 할 행동 1~2개"]
+  "need_more_info": false,
+  "ask_back": ["사용자에게 추가로 물어볼 질문 1~3개"]
 }}
 """
 
@@ -220,21 +271,48 @@ def process_image_bytes(image_bytes: bytes,
     o_client = build_openai_client(openai_key)
     full_text, boxes = gcv_ocr(image_bytes, v_client)
     doc_type = guess_doc_type(full_text)
-    summary = llm_summarize(full_text, doc_type, o_client)
+    # summary = llm_summarize(full_text, doc_type, o_client)
     tags = extract_tags(full_text)
+    # 일정 추출(팀 요청: 제목/날짜범위/시간범위)
+    schedule = extract_schedule(full_text)
+
+    # 정보부족 처리
+    low = is_low_info(full_text, tags)
+    if low:
+        summary = {
+            "bullets": [],
+            "next_actions": [],
+            "need_more_info": True,
+            "ask_back": [
+                "이 문서가 어떤 내용인지 한 줄로 알려주실 수 있을까요?",
+                "일정이라면 제목, 날짜 범위, 시간 범위를 알려주세요.",
+            ],
+        }
+    else:
+        summary = llm_summarize(full_text, doc_type, o_client)
+        # 모델이 과하게 말했을 가능성 최소화: 본문에 없는 숫자 URL이 다수인 경우 제약
+        if len(summary.get("bullets", [])) == 0 and len(summary.get("next_actions", [])) == 0:
+            summary["need_more_info"] = True
+            if not summary.get("ask_back"):
+                summary["ask_back"] = ["이 문서의 핵심이 무엇인지 설명해주시면 더 정확히 도와드릴게요."]
+
     return {
         "doc_type": doc_type,
         "full_text": full_text,
         "boxes": boxes,
-        "summary": summary,
         "tags": tags,
+        "summary": summary,
+        "schedule_suggestion": schedule,  # {title, date_range, time_range}
     }
 
 def build_tts_from_summary(summary: Dict, full_text: Optional[str] = None, mode: str = "summary") -> bytes:
     if mode == "summary":
         bullets = (summary or {}).get("bullets", [])
         acts = (summary or {}).get("next_actions", [])
-        speak_text = " / ".join([*bullets, *acts]) or "요약이 비어 있습니다."
+        if (summary or {}).get("need_more_info"):
+            speak_text = "사진만으로는 정보가 부족해요. 문서 내용이나 일정의 제목, 날짜 범위, 시간 범위를 알려주시면 정확히 도와드릴게요."
+        else:
+            speak_text = " / ".join([*bullets, *acts]) or "요약이 비어 있습니다."
         return tts_bytes_ko(speak_text)
     else:
         txt = (full_text or "").strip() or "읽을 내용이 없습니다. 다시 시도해 주세요."
