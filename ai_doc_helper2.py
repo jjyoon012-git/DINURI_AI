@@ -215,7 +215,7 @@ PROMPT_TEMPLATE = """
 출력(JSON 형식):
 {{
   "bullets": ["핵심 3~5가지 요약"],
-  "next_actions": ["지금 해야 할 행동 1~2개"]
+  "next_actions": ["지금 해야 할 행동 1~2개"],
   "need_more_info": false,
   "ask_back": ["사용자에게 추가로 물어볼 질문 1~3개"]
 }}
