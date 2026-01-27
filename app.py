@@ -107,7 +107,7 @@ async def ocr_summarize(
         schedule_suggestion = result.get("schedule_suggestion")
         schedule_suggestion_legacy = result.get("schedule_suggestion_legacy")
 
-        # ISO 8601로 수정했습니다.
+        # ISO 8601로 수정 + 캘린더 제목(title)은 LLM 기반(실패 시 fallback)
         return JSONResponse({
             "doc_type": doc_type,
             "summary": summary,

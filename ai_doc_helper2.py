@@ -1,3 +1,4 @@
+# ai_doc_helper2.py
 # Google Cloud Vision OCR + OpenAI GPT-4o-mini + gTTS
 
 from dotenv import load_dotenv
@@ -217,8 +218,7 @@ def extract_schedule(text: str) -> Dict[str, Optional[str]]:
 
 
 # -------------------------------------------------------------------
-# (26-01-27) NEW: ISO 8601 규격 schedule_suggestion 
-# - 새 함수 extract_schedule_iso() 추가 후 process_image_bytes에서 사용
+# (26-01-27) NEW: ISO 8601 규격 schedule_suggestion + LLM title
 # -------------------------------------------------------------------
 from datetime import datetime
 
@@ -279,7 +279,72 @@ def _to_hhmm(h: int, m: int) -> str:
     return f"{_pad2(h)}:{_pad2(m)}"
 
 
-def extract_schedule_iso(text: str) -> Dict[str, Optional[object]]:
+def _fallback_title_rule(text: str) -> str:
+    title = ""
+    for line in (text or "").splitlines():
+        if any(k in line for k in ["회의", "세미나", "행사", "일정", "미팅", "발표", "시연", "면접", "수업", "강의", "오리엔테이션"]):
+            title = line.strip()[:120]
+            break
+    return title
+
+
+def llm_schedule_title(doc_text: str, client) -> str:
+    """
+    캘린더 제목용: 짧고 자연스럽게(10~30자 권장)
+    - 날짜/시간/괄호/세부설명/번호 제거 유도
+    - 근거 부족하면 빈 문자열
+    - JSON only 강제
+    """
+    prompt = f"""
+너는 캘린더 앱의 "일정 제목 생성기"다.
+아래 OCR 텍스트를 보고,
+사람이 캘린더에 한 줄로 적을 법한 일정 제목을 만들어라.
+
+작성 기준:
+- 캘린더 제목처럼 짧고 명확하게 (5~20자 권장)
+- 명사형 또는 "~안내", "~발표", "~신청", "~마감" 형태 선호
+- 날짜, 시간, 요일, 장소, 번호, 금액, 괄호 설명은 포함하지 않는다
+- 문서에 명확히 드러난 일정만 제목으로 만든다
+- 애매하면 빈 문자열을 반환한다
+
+반드시 JSON만 출력:
+{{"title": "..."}} 또는 {{"title": ""}}
+
+OCR 텍스트:
+\"\"\"{(doc_text or "")[:1200]}\"\"\"
+""".strip()
+
+    if _OPENAI_SDK_V1:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": "JSON만 출력하세요."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content
+    else:
+        resp = client.ChatCompletion.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": "JSON만 출력하세요."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp["choices"][0]["message"]["content"]
+
+    content = (content or "").strip().strip("`")
+    if content.lower().startswith("json"):
+        content = content[4:].strip()
+
+    data = json.loads(content)
+    title = (data.get("title") or "").strip()
+    return title[:40]
+
+
+def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
     """
     ISO 8601 스펙:
     {
@@ -294,16 +359,10 @@ def extract_schedule_iso(text: str) -> Dict[str, Optional[object]]:
 
     정책:
     - 날짜만 있고 시간이 없으면 all_day=True, start_time/end_time=None
-    - 날짜/시간이 모두 없으면 all_day=False + 날짜/시간 None (프론트에서 null 처리 가능)
+    - 날짜/시간이 모두 없으면 all_day=False + 날짜/시간 None
+    - title은 LLM로 생성(캘린더용), 실패/빈값이면 규칙 기반 fallback
     """
-    title = ""
     now_year = datetime.now().year
-
-    # title 후보: AI Module 추가 예정
-    for line in (text or "").splitlines():
-        if any(k in line for k in ["회의", "세미나", "행사", "일정", "미팅", "발표", "시연", "면접", "수업", "강의", "오리엔테이션"]):
-            title = line.strip()[:120]
-            break
 
     # dates 수집
     date_hits: List[str] = []
@@ -348,8 +407,21 @@ def extract_schedule_iso(text: str) -> Dict[str, Optional[object]]:
     # all_day 정책
     all_day = bool(start_date and (start_time is None and end_time is None))
 
+    # title (fallback 먼저)
+    fallback_title = _fallback_title_rule(text)
+    title = fallback_title
+
+    # ✅ 날짜가 있는 경우에만(일정 가능성) LLM로 제목 생성 시도
+    if client is not None and start_date:
+        try:
+            llm_title = llm_schedule_title(text, client)
+            if llm_title:
+                title = llm_title
+        except Exception:
+            title = fallback_title
+
     return {
-        "title": title,
+        "title": (title or "")[:120],
         "start_date": start_date,
         "end_date": end_date,
         "start_time": start_time,
@@ -394,8 +466,8 @@ def llm_summarize(doc_text: str, doc_type: str, client) -> Dict:
         content = resp.choices[0].message.content
     else:
         resp = client.ChatCompletion.create(
-            model="gpt-4o-mini",  # version 1.0.0: gpt-4o-mini
-            temperature=0.2,  # temperature = 창의성 (낮을수록 정형화된 답변 제공)
+            model="gpt-4o-mini",
+            temperature=0.2,
             messages=[
                 {"role": "system", "content": "JSON만 출력하세요."},
                 {"role": "user", "content": prompt},
@@ -437,9 +509,9 @@ def process_image_bytes(
 
     tags = extract_tags(full_text)
 
-    # 일정 추출 (ISO)
+    # 일정 추출 (ISO + LLM title)
     schedule_legacy = extract_schedule(full_text)
-    schedule_iso = extract_schedule_iso(full_text)
+    schedule_iso = extract_schedule_iso(full_text, client=o_client)
 
     # 정보부족 처리
     low = is_low_info(full_text, tags)
@@ -468,7 +540,7 @@ def process_image_bytes(
         "tags": tags,
         "summary": summary,
 
-        # (ISO 8601)
+        # (ISO 8601 + 캘린더용 title)
         "schedule_suggestion": schedule_iso,
         "schedule_suggestion_legacy": schedule_legacy,
     }
