@@ -111,7 +111,7 @@ TAG_REGEX = {
         r"\bwww\.[^\s]+"
     ],
 }
-# 개인정보 관련 태깅을 따로 하였습니다.
+# 개인정보 관련 태깅을 따로 하였습니다. => AI Module 연결 예정
 TAG_KEYWORDS = {
     "기관/부서": ["국민건강보험", "국세청", "행정복지센터", "시청", "구청", "병원", "의원", "은행", "보험사", "카드사", "고용센터", "연금공단"],
     "신분/개인식별": ["성명", "이름", "생년월일", "주민등록번호", "주소", "연락처"],
@@ -176,9 +176,16 @@ def is_low_info(text: str, tags: Dict[str, List[str]]) -> bool:
 # -------------------------------------------------------------------
 TIME_PAT = re.compile(r"(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?\s*(~|-|부터)\s*(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?")
 TIME_SIMPLE = re.compile(r"(오전|오후)?\s*\d{1,2}\s*(~|-)\s*(오전|오후)?\s*\d{1,2}\s*")
+
+# ✅ PATCH: 날짜 패턴 확장(붙여쓰기/마침표 포함)
 DATE_PATS = [
-    re.compile(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}"),
-    re.compile(r"\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일"),
+    # 2025-12-15 / 2025.12.15 / 2025/12/15 / 2025.12.15.
+    re.compile(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}\.?"),
+
+    # 2025년12월15일 / 2025년 12월 15일
+    re.compile(r"20\d{2}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일"),
+
+    # 12월15일 / 12월 15일
     re.compile(r"\d{1,2}\s*월\s*\d{1,2}\s*일"),
 ]
 
@@ -220,6 +227,8 @@ def extract_schedule(text: str) -> Dict[str, Optional[str]]:
 # -------------------------------------------------------------------
 # (26-01-27) NEW: ISO 8601 규격 schedule_suggestion + LLM title
 # + (PATCH) 기간/등록/마감 키워드 기반 범위 우선 추출
+# + (PATCH) 날짜 없으면 schedule_suggestion을 "빈 일정"으로 반환
+# + (PATCH) 캘린더 제목 프롬프트: 문서 내용을 객관적으로 분석하도록 개선
 # -------------------------------------------------------------------
 from datetime import datetime
 
@@ -244,19 +253,23 @@ def _to_iso_date(y: int, m: int, d: int) -> str:
 
 def _parse_date_token(s: str, default_year: int) -> Optional[str]:
     s = (s or "").strip()
-    # 2026-01-27 / 2026.01.27 / 2026/01/27
-    m1 = re.match(r"^(20\d{2})[./-](\d{1,2})[./-](\d{1,2})$", s)
+
+    # ✅ PATCH: 끝에 '.' 같은 문장부호 제거
+    s = re.sub(r"[^\w가-힣./-]+$", "", s)
+
+    # 2026-01-27 / 2026.01.27 / 2026/01/27 / 2026.01.27.
+    m1 = re.match(r"^(20\d{2})[./-](\d{1,2})[./-](\d{1,2})\.?$", s)
     if m1:
         y, mo, da = map(int, m1.groups())
         return _to_iso_date(y, mo, da)
 
-    # 2026년 1월 27일
+    # 2026년1월27일 / 2026년 1월 27일
     m2 = re.match(r"^(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일$", s)
     if m2:
         y, mo, da = map(int, m2.groups())
         return _to_iso_date(y, mo, da)
 
-    # 1월 27일 (연도 없음 → default_year)
+    # 1월27일 / 1월 27일 (연도 없음 → default_year)
     m3 = re.match(r"^(\d{1,2})\s*월\s*(\d{1,2})\s*일$", s)
     if m3:
         mo, da = map(int, m3.groups())
@@ -291,28 +304,30 @@ def _fallback_title_rule(text: str) -> str:
 
 def llm_schedule_title(doc_text: str, client) -> str:
     """
-    캘린더 제목용: 짧고 자연스럽게(10~30자 권장)
-    - 날짜/시간/괄호/세부설명/번호 제거 유도
-    - 근거 부족하면 빈 문자열
-    - JSON only 강제
+    캘린더 제목용: 짧고 자연스럽게
+    - 문서 내용을 "객관적으로 분석"해서 일정의 성격을 판별 후 제목 생성
+    - 날짜/시간/요약문장/조항문구/긴 문장 방지
+    - 애매하면 빈 문자열
+    - JSON only
     """
     prompt = f"""
-너는 캘린더 앱의 "일정 제목 생성기"다.
-아래 OCR 텍스트를 보고,
-사람이 캘린더에 한 줄로 적을 법한 일정 제목을 만들어라.
+역할: 당신은 문서(OCR 텍스트)를 객관적으로 분석하여, 캘린더에 추가할 "일정 제목"만 생성하는 도우미다.
 
-작성 기준:
-- 캘린더 제목처럼 짧고 명확하게 (5~20자 권장)
-- 명사형 또는 "~안내", "~발표", "~신청", "~마감" 형태 선호
-- 날짜, 시간, 요일, 장소, 번호, 금액, 괄호 설명은 포함하지 않는다
-- 문서에 명확히 드러난 일정만 제목으로 만든다
-- 애매하면 빈 문자열을 반환한다
+목표:
+- 문서의 핵심이 "어떤 일정 이벤트인지"를 객관적으로 파악한 뒤, 캘린더 제목 1개를 생성한다.
 
-반드시 JSON만 출력:
+규칙:
+- 5~20자 내외의 짧은 제목
+- 날짜/시간/요일/장소/번호/금액/괄호 설명/긴 문장을 포함하지 않는다
+- 문서에 실제로 존재하는 이벤트(예: 등록, 신청, 접수, 제출, 납부, 마감, 발표, 안내 등)만 제목으로 만든다
+- 문장 조각(조항/안내문 문장)을 그대로 제목으로 쓰지 않는다
+- 일정 근거가 불명확하면 빈 문자열
+
+출력은 반드시 JSON만:
 {{"title": "..."}} 또는 {{"title": ""}}
 
 OCR 텍스트:
-\"\"\"{(doc_text or "")[:1200]}\"\"\"
+\"\"\"{(doc_text or "")[:1500]}\"\"\"
 """.strip()
 
     if _OPENAI_SDK_V1:
@@ -342,6 +357,12 @@ OCR 텍스트:
 
     data = json.loads(content)
     title = (data.get("title") or "").strip()
+
+    # ✅ 방어: 너무 길거나 문장부호 많으면 무효 처리
+    if len(title) > 40:
+        return ""
+    if sum(1 for ch in title if ch in [",", ".", "，", "。", ":", ";"]) >= 2:
+        return ""
     return title[:40]
 
 
@@ -435,10 +456,10 @@ def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
     }
 
     정책:
-    - (중요) '등록/신청/접수/마감/기간/기한' 등 키워드가 붙은 날짜+시간 "범위"를 최우선으로 캘린더 일정으로 선택
-      -> 요약에 나타나는 등록 기간과 캘린더 일정의 불일치 문제를 줄임
+    - '등록/신청/접수/마감/기간/기한' 키워드가 붙은 날짜+시간 "범위"를 최우선으로 캘린더 일정으로 선택
     - 범위가 없으면 기존 방식(첫 날짜/시간) fallback
     - 날짜만 있고 시간이 없으면 all_day=True
+    - 날짜가 하나도 없으면 일정이 아니라고 보고, title 포함 전부 빈 값으로 반환(프론트 혼란 방지)
     - title은 LLM로 생성(캘린더용), 실패/빈값이면 규칙 기반 fallback
     """
     now_year = datetime.now().year
@@ -507,6 +528,18 @@ def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
                 start_time = _to_hhmm(H1, M1)
                 end_time = _to_hhmm(H2, M2)
 
+    # ✅ PATCH: 날짜가 없으면 일정이 아닌 것으로 처리 (title도 비움)
+    if not start_date:
+        return {
+            "title": "",
+            "start_date": None,
+            "end_date": None,
+            "start_time": None,
+            "end_time": None,
+            "timezone": KST_TZ,
+            "all_day": False,
+        }
+
     # all_day 정책
     all_day = bool(start_date and (start_time is None and end_time is None))
 
@@ -514,8 +547,8 @@ def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
     fallback_title = _fallback_title_rule(text)
     title = fallback_title
 
-    # 날짜가 있는 경우에만(일정 가능성) LLM로 제목 생성 시도
-    if client is not None and start_date:
+    # 날짜가 있는 경우(여기까지 왔으면 있음) LLM로 제목 생성 시도
+    if client is not None:
         try:
             llm_title = llm_schedule_title(text, client)
             if llm_title:
