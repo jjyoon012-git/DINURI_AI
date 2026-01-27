@@ -22,6 +22,7 @@ except Exception:
     _OPENAI_SDK_V1 = False
 
 from gtts import gTTS
+from datetime import datetime
 
 # DNS resolver
 os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
@@ -30,6 +31,8 @@ os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
 load_dotenv()
 DEFAULT_GCP_KEY = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 DEFAULT_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+KST_TZ = "Asia/Seoul"
 
 
 def build_vision_client(key_path: Optional[str] = None) -> vision.ImageAnnotatorClient:
@@ -83,12 +86,17 @@ def draw_boxes(pil_img: Image.Image, boxes: List[List[Tuple[int, int]]], stroke:
     return out
 
 
-# tag extraction by regex
+# -----------------------------
+# Tag extraction (regex)
+# -----------------------------
 TAG_REGEX = {
     "날짜": [
-        r"\b20\d{2}[./-]\d{1,2}[./-]\d{1,2}\b",
-        r"\b\d{1,2}\s*월\s*\d{1,2}\s*일\b",
-        r"\b\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일\b"
+        # 2025-12-15 / 2025.12.15 / 2025/12/15 + 뒤에 . 또는 (월) 같은 요일 괄호 허용
+        r"\b20\d{2}[./-]\d{1,2}[./-]\d{1,2}(?:\.)?(?:\([월화수목금토일]\))?\b",
+        # 12월 15일(월) 형태
+        r"\b\d{1,2}\s*월\s*\d{1,2}\s*일(?:\([월화수목금토일]\))?\b",
+        # 2025년 12월 15일(월) 형태
+        r"\b20\d{2}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일(?:\([월화수목금토일]\))?\b"
     ],
     "금액": [
         r"\b[0-9]{1,3}(?:,[0-9]{3})*(?:\s*원)\b",
@@ -111,7 +119,7 @@ TAG_REGEX = {
         r"\bwww\.[^\s]+"
     ],
 }
-# 개인정보 관련 태깅을 따로 하였습니다. => AI Module 연결 예정
+
 TAG_KEYWORDS = {
     "기관/부서": ["국민건강보험", "국세청", "행정복지센터", "시청", "구청", "병원", "의원", "은행", "보험사", "카드사", "고용센터", "연금공단"],
     "신분/개인식별": ["성명", "이름", "생년월일", "주민등록번호", "주소", "연락처"],
@@ -140,7 +148,9 @@ def extract_tags(text: str) -> Dict[str, List[str]]:
     return {k: v for k, v in found.items() if v}
 
 
-# 문서 종류 분류해뒀는데, version 1.0.0에서는 사용 안 하고 있습니다.
+# -----------------------------
+# Doc type
+# -----------------------------
 DOC_TYPES = {
     "정부·공공": ["지원금", "세금", "건강보험", "환급"],
     "의료": ["진단서", "혈압", "혈당", "검사", "병원"],
@@ -160,13 +170,10 @@ def guess_doc_type(text: str) -> str:
     return best
 
 
-# 할루시네이션 방지
 def is_low_info(text: str, tags: Dict[str, List[str]]) -> bool:
-    # 길이가 매우 짧거나, 숫자/한글이 거의 없거나, 태그가 비어 있으면 정보부족으로 판단
     t = (text or "").strip()
     if len(t) < 25:
         return True
-    # 의미있는 한글/숫자 토큰 개수 기준
     tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", t)
     return len(tokens) < 10 and len(tags) == 0
 
@@ -174,19 +181,16 @@ def is_low_info(text: str, tags: Dict[str, List[str]]) -> bool:
 # -------------------------------------------------------------------
 # Schedule extraction (LEGACY: title/date_range/time_range)
 # -------------------------------------------------------------------
-TIME_PAT = re.compile(r"(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?\s*(~|-|부터)\s*(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?")
+TIME_PAT = re.compile(
+    r"(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?\s*(~|-|부터)\s*(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?"
+)
 TIME_SIMPLE = re.compile(r"(오전|오후)?\s*\d{1,2}\s*(~|-)\s*(오전|오후)?\s*\d{1,2}\s*")
 
-# ✅ PATCH: 날짜 패턴 확장(붙여쓰기/마침표 포함)
+# 날짜 토큰은 요일/괄호/마침표가 붙어도 매칭되게
 DATE_PATS = [
-    # 2025-12-15 / 2025.12.15 / 2025/12/15 / 2025.12.15.
-    re.compile(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}\.?"),
-
-    # 2025년12월15일 / 2025년 12월 15일
-    re.compile(r"20\d{2}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일"),
-
-    # 12월15일 / 12월 15일
-    re.compile(r"\d{1,2}\s*월\s*\d{1,2}\s*일"),
+    re.compile(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}(?:\.)?(?:\([월화수목금토일]\))?"),
+    re.compile(r"20\d{2}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일(?:\([월화수목금토일]\))?"),
+    re.compile(r"\d{1,2}\s*월\s*\d{1,2}\s*일(?:\([월화수목금토일]\))?"),
 ]
 
 
@@ -197,25 +201,26 @@ def extract_schedule(text: str) -> Dict[str, Optional[str]]:
     title = None
     date_hits: List[str] = []
     time_hits: List[str] = []
-    # 날짜
+
     for p in DATE_PATS:
         date_hits += p.findall(text or "")
-    # 시간
+
     time_hits += TIME_PAT.findall(text or "")
     if not time_hits:
         time_hits += TIME_SIMPLE.findall(text or "")
-    # 타이틀 후보: 회의/세미나/행사/일정/미팅/발표 등 포함된 첫 줄
+
     for line in (text or "").splitlines():
         if any(k in line for k in ["회의", "세미나", "행사", "일정", "미팅", "발표", "시연", "면접", "수업", "강의", "오리엔테이션"]):
             title = line.strip()
             break
-    # 정리
+
     date_range = " ~ ".join(date_hits[:2]) if date_hits else ""
-    # 시간 정규식 튜플을 문자열로 정리
+
     def _norm_time(hit):
         if isinstance(hit, tuple):
             return "".join([h for h in hit if isinstance(h, str)])
         return hit
+
     time_range = " ~ ".join([_norm_time(h) for h in time_hits[:2]]) if time_hits else ""
     return {
         "title": (title or "")[:120],
@@ -225,23 +230,8 @@ def extract_schedule(text: str) -> Dict[str, Optional[str]]:
 
 
 # -------------------------------------------------------------------
-# (26-01-27) NEW: ISO 8601 규격 schedule_suggestion + LLM title
-# + (PATCH) 기간/등록/마감 키워드 기반 범위 우선 추출
-# + (PATCH) 날짜 없으면 schedule_suggestion을 "빈 일정"으로 반환
-# + (PATCH) 캘린더 제목 프롬프트: 문서 내용을 객관적으로 분석하도록 개선
+# ISO 8601 schedule_suggestion + LLM title
 # -------------------------------------------------------------------
-from datetime import datetime
-
-KST_TZ = "Asia/Seoul"
-
-ISO_TIME_PAT = re.compile(
-    r"(오전|오후)?\s*(\d{1,2})(?:[:시]\s*(\d{1,2}))?\s*(?:분)?\s*(~|-|부터|까지)\s*"
-    r"(오전|오후)?\s*(\d{1,2})(?:[:시]\s*(\d{1,2}))?\s*(?:분)?"
-)
-ISO_TIME_SIMPLE = re.compile(
-    r"(오전|오후)?\s*(\d{1,2})\s*(~|-)\s*(오전|오후)?\s*(\d{1,2})\s*"
-)
-
 
 def _pad2(n: int) -> str:
     return f"{n:02d}"
@@ -251,31 +241,8 @@ def _to_iso_date(y: int, m: int, d: int) -> str:
     return f"{y}-{_pad2(m)}-{_pad2(d)}"
 
 
-def _parse_date_token(s: str, default_year: int) -> Optional[str]:
-    s = (s or "").strip()
-
-    # ✅ PATCH: 끝에 '.' 같은 문장부호 제거
-    s = re.sub(r"[^\w가-힣./-]+$", "", s)
-
-    # 2026-01-27 / 2026.01.27 / 2026/01/27 / 2026.01.27.
-    m1 = re.match(r"^(20\d{2})[./-](\d{1,2})[./-](\d{1,2})\.?$", s)
-    if m1:
-        y, mo, da = map(int, m1.groups())
-        return _to_iso_date(y, mo, da)
-
-    # 2026년1월27일 / 2026년 1월 27일
-    m2 = re.match(r"^(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일$", s)
-    if m2:
-        y, mo, da = map(int, m2.groups())
-        return _to_iso_date(y, mo, da)
-
-    # 1월27일 / 1월 27일 (연도 없음 → default_year)
-    m3 = re.match(r"^(\d{1,2})\s*월\s*(\d{1,2})\s*일$", s)
-    if m3:
-        mo, da = map(int, m3.groups())
-        return _to_iso_date(default_year, mo, da)
-
-    return None
+def _to_hhmm(h: int, m: int) -> str:
+    return f"{_pad2(h)}:{_pad2(m)}"
 
 
 def _parse_ko_time(ampm: Optional[str], hour: int, minute: int) -> Tuple[int, int]:
@@ -289,42 +256,174 @@ def _parse_ko_time(ampm: Optional[str], hour: int, minute: int) -> Tuple[int, in
     return h, minute
 
 
-def _to_hhmm(h: int, m: int) -> str:
-    return f"{_pad2(h)}:{_pad2(m)}"
+def _strip_date_suffix(token: str) -> str:
+    """
+    날짜 토큰 뒤에 붙는 요일 괄호, 마침표, 기타 문장부호 제거
+    예: "2025.12.15.(월)" -> "2025.12.15"
+        "2025-12-15(월)"   -> "2025-12-15"
+        "2025/12/15."      -> "2025/12/15"
+    """
+    s = (token or "").strip()
+    # 끝의 문장부호 제거
+    s = re.sub(r"[.,;:]+$", "", s)
+    # 끝의 요일 괄호 제거
+    s = re.sub(r"\([월화수목금토일]\)$", "", s).strip()
+    return s
+
+
+def _parse_date_token(s: str, default_year: int) -> Optional[str]:
+    s = _strip_date_suffix(s)
+
+    # 2026-01-27 / 2026.01.27 / 2026/01/27
+    m1 = re.match(r"^(20\d{2})[./-](\d{1,2})[./-](\d{1,2})$", s)
+    if m1:
+        y, mo, da = map(int, m1.groups())
+        return _to_iso_date(y, mo, da)
+
+    # 2026년 1월 27일
+    m2 = re.match(r"^(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일$", s)
+    if m2:
+        y, mo, da = map(int, m2.groups())
+        return _to_iso_date(y, mo, da)
+
+    # 1월 27일 (연도 없음)
+    m3 = re.match(r"^(\d{1,2})\s*월\s*(\d{1,2})\s*일$", s)
+    if m3:
+        mo, da = map(int, m3.groups())
+        return _to_iso_date(default_year, mo, da)
+
+    return None
+
+
+# (1) 범위 우선: "등록기간/신청기간/접수기간/마감" 주변에 있는 범위를 고르는 점수
+RANGE_KEYWORDS = ["등록", "등록기간", "등록 기간", "문서 등록", "신청", "신청기간", "접수", "접수기간", "제출", "납부", "마감", "기한", "기간", "안내", "발표"]
+
+def _score_context(text: str, start: int, end: int) -> int:
+    win = (text or "")[max(0, start - 80): min(len(text or ""), end + 80)]
+    score = 0
+    for kw in RANGE_KEYWORDS:
+        if kw in win:
+            score += 1
+    return score
+
+
+def _pick_best_match(text: str, matches: List[re.Match]) -> Optional[re.Match]:
+    if not matches:
+        return None
+    best = matches[0]
+    best_score = _score_context(text, best.start(), best.end())
+    for m in matches[1:]:
+        sc = _score_context(text, m.start(), m.end())
+        if sc > best_score:
+            best = m
+            best_score = sc
+    return best
+
+
+# (A) 한국어 날짜+시간 범위
+# 예: 2025년 12월 15일(월) 09:00부터 12월 17일(수) 14:00까지
+KO_DATE_TIME_RANGE_PAT = re.compile(
+    r"(?:\b(20\d{2})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일(?:\([월화수목금토일]\))?\s*"
+    r"(오전|오후)?\s*(\d{1,2})\s*[:시]\s*(\d{2})\s*(?:분)?\s*"
+    r"(?:부터|~|-)\s*"
+    r"(?:\b(20\d{2})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일(?:\([월화수목금토일]\))?\s*"
+    r"(오전|오후)?\s*(\d{1,2})\s*[:시]\s*(\d{2})\s*(?:분)?\s*(?:까지)?"
+)
+
+# (B) 숫자 날짜+시간 범위
+# 예: 2025-12-15(월) 09:00 ~ 2025-12-17 14:00
+NUM_DATE_TIME_RANGE_PAT = re.compile(
+    r"\b(20\d{2})[./-](\d{1,2})[./-](\d{1,2})(?:\.)?(?:\([월화수목금토일]\))?\s+"
+    r"(\d{1,2})\s*:\s*(\d{2})\s*(?:~|-|부터)\s*"
+    r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})(?:\.)?(?:\([월화수목금토일]\))?\s+"
+    r"(\d{1,2})\s*:\s*(\d{2})\b"
+)
+
+# (C) 한 날짜 + 24h 시간 범위
+# 예: 2025-12-15(월) 09:00 ~ 10:00
+ONE_DATE_24H_TIME_RANGE_PAT = re.compile(
+    r"\b(20\d{2}[./-]\d{1,2}[./-]\d{1,2}(?:\.)?(?:\([월화수목금토일]\))?)\s+"
+    r"(\d{1,2})\s*:\s*(\d{2})\s*(?:~|-|부터)\s*(\d{1,2})\s*:\s*(\d{2})\b"
+)
+
+# (D) 시간만 존재 (24h)
+TIME_24H_RANGE_PAT = re.compile(r"\b(\d{1,2})\s*:\s*(\d{2})\s*(?:~|-|부터)\s*(\d{1,2})\s*:\s*(\d{2})\b")
+
+# (E) 오전/오후 시간 범위(분 생략 허용)
+KO_TIME_RANGE_PAT = re.compile(
+    r"(오전|오후)?\s*(\d{1,2})(?:[:시]\s*(\d{1,2}))?\s*(?:분)?\s*(~|-|부터|까지)\s*"
+    r"(오전|오후)?\s*(\d{1,2})(?:[:시]\s*(\d{1,2}))?\s*(?:분)?"
+)
+
+
+def _parse_ko_date_time_range_match(m: re.Match, default_year: int):
+    y1, mo1, d1, ampm1, h1, mi1, y2, mo2, d2, ampm2, h2, mi2 = m.groups()
+    y1 = int(y1) if y1 else default_year
+    y2 = int(y2) if y2 else y1
+
+    mo1, d1 = int(mo1), int(d1)
+    mo2, d2 = int(mo2), int(d2)
+
+    h1, mi1 = int(h1), int(mi1)
+    h2, mi2 = int(h2), int(mi2)
+
+    H1, M1 = _parse_ko_time(ampm1, h1, mi1)
+    H2, M2 = _parse_ko_time(ampm2, h2, mi2)
+
+    return (
+        _to_iso_date(y1, mo1, d1),
+        _to_iso_date(y2, mo2, d2),
+        _to_hhmm(H1, M1),
+        _to_hhmm(H2, M2),
+    )
+
+
+def _parse_num_date_time_range_match(m: re.Match):
+    y1, mo1, d1, h1, mi1, y2, mo2, d2, h2, mi2 = m.groups()
+    return (
+        _to_iso_date(int(y1), int(mo1), int(d1)),
+        _to_iso_date(int(y2), int(mo2), int(d2)),
+        _to_hhmm(int(h1), int(mi1)),
+        _to_hhmm(int(h2), int(mi2)),
+    )
+
+
+def _parse_one_date_24h_time_range_match(m: re.Match, default_year: int):
+    date_token, h1, mi1, h2, mi2 = m.groups()
+    sd = _parse_date_token(date_token, default_year=default_year)
+    if not sd:
+        return None, None, None, None
+    return sd, sd, _to_hhmm(int(h1), int(mi1)), _to_hhmm(int(h2), int(mi2))
 
 
 def _fallback_title_rule(text: str) -> str:
-    title = ""
+    # 캘린더 제목 후보 키워드 확장(안내/등록/신청/마감/발표 등)
     for line in (text or "").splitlines():
-        if any(k in line for k in ["회의", "세미나", "행사", "일정", "미팅", "발표", "시연", "면접", "수업", "강의", "오리엔테이션"]):
-            title = line.strip()[:120]
-            break
-    return title
+        if any(k in line for k in ["등록", "신청", "접수", "제출", "납부", "마감", "발표", "안내", "면접", "오리엔테이션", "설명회", "회의", "세미나", "행사"]):
+            s = line.strip()
+            # 너무 긴 문장은 잘라서
+            return s[:80]
+    return ""
 
 
 def llm_schedule_title(doc_text: str, client) -> str:
     """
-    캘린더 제목용: 짧고 자연스럽게
-    - 문서 내용을 "객관적으로 분석"해서 일정의 성격을 판별 후 제목 생성
-    - 날짜/시간/요약문장/조항문구/긴 문장 방지
-    - 애매하면 빈 문자열
+    캘린더 제목용: 문서 내용을 객관적으로 분석한 뒤, 제목 1개만 생성
+    - 근거 부족하면 빈 문자열
     - JSON only
     """
     prompt = f"""
-역할: 당신은 문서(OCR 텍스트)를 객관적으로 분석하여, 캘린더에 추가할 "일정 제목"만 생성하는 도우미다.
+역할: 문서(OCR 텍스트)를 객관적으로 분석해서, 캘린더에 추가할 일정 제목 1개만 만든다.
 
-목표:
-- 문서의 핵심이 "어떤 일정 이벤트인지"를 객관적으로 파악한 뒤, 캘린더 제목 1개를 생성한다.
-
-규칙:
-- 5~20자 내외의 짧은 제목
-- 날짜/시간/요일/장소/번호/금액/괄호 설명/긴 문장을 포함하지 않는다
-- 문서에 실제로 존재하는 이벤트(예: 등록, 신청, 접수, 제출, 납부, 마감, 발표, 안내 등)만 제목으로 만든다
-- 문장 조각(조항/안내문 문장)을 그대로 제목으로 쓰지 않는다
+원칙:
+- 6~20자 내외
+- 날짜/시간/요일/장소/번호/금액/괄호 설명은 포함하지 않는다
+- 문서에 실제로 존재하는 이벤트(등록/신청/접수/제출/납부/마감/발표/안내 등)만 제목으로 만든다
+- 조항 문장 일부를 그대로 제목으로 쓰지 않는다
 - 일정 근거가 불명확하면 빈 문자열
 
-출력은 반드시 JSON만:
-{{"title": "..."}} 또는 {{"title": ""}}
+출력은 반드시 JSON:
+{{"title":"..."}} 또는 {{"title":""}}
 
 OCR 텍스트:
 \"\"\"{(doc_text or "")[:1500]}\"\"\"
@@ -355,91 +454,21 @@ OCR 텍스트:
     if content.lower().startswith("json"):
         content = content[4:].strip()
 
-    data = json.loads(content)
+    try:
+        data = json.loads(content)
+    except Exception:
+        return ""
+
     title = (data.get("title") or "").strip()
 
-    # ✅ 방어: 너무 길거나 문장부호 많으면 무효 처리
+    # 방어: 문장처럼 길거나 쉼표/조항 느낌이면 제거
     if len(title) > 40:
         return ""
     if sum(1 for ch in title if ch in [",", ".", "，", "。", ":", ";"]) >= 2:
         return ""
+    if "경우" in title and len(title) >= 16:
+        return ""
     return title[:40]
-
-
-# -----------------------------
-# (PATCH) 기간 범위 우선 추출
-# -----------------------------
-RANGE_KEYWORDS = ["등록", "문서 등록", "등록기간", "등록 기간", "신청", "접수", "제출", "납부", "마감", "기한", "기간"]
-
-# 예: 2025년 12월 15일 09:00부터 12월 17일 14:00까지
-KO_DATE_TIME_RANGE_PAT = re.compile(
-    r"(?:\b(20\d{2})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일\s*"
-    r"(오전|오후)?\s*(\d{1,2})\s*(?:[:시]\s*(\d{1,2}))?\s*(?:분)?\s*"
-    r"(?:부터|~|-)\s*"
-    r"(?:\b(20\d{2})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일\s*"
-    r"(오전|오후)?\s*(\d{1,2})\s*(?:[:시]\s*(\d{1,2}))?\s*(?:분)?\s*"
-    r"(?:까지)?"
-)
-
-# 예: 2025.12.15 09:00 ~ 2025.12.17 14:00 (또는 2025-12-15 09:00 ~ 2025-12-17 14:00)
-NUM_DATE_TIME_RANGE_PAT = re.compile(
-    r"\b(20\d{2})[./-](\d{1,2})[./-](\d{1,2})\s+(\d{1,2}):(\d{2})\s*(?:~|-)\s*"
-    r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})\s+(\d{1,2}):(\d{2})\b"
-)
-
-
-def _score_range_context(text: str, span_start: int, span_end: int) -> int:
-    win = (text or "")[max(0, span_start - 60): min(len(text or ""), span_end + 60)]
-    score = 0
-    for kw in RANGE_KEYWORDS:
-        if kw in win:
-            score += 1
-    return score
-
-
-def _pick_best_match(text: str, matches: List[re.Match]) -> Optional[re.Match]:
-    if not matches:
-        return None
-    best = matches[0]
-    best_score = _score_range_context(text, best.start(), best.end())
-    for m in matches[1:]:
-        sc = _score_range_context(text, m.start(), m.end())
-        if sc > best_score:
-            best = m
-            best_score = sc
-    return best
-
-
-def _parse_ko_date_time_range_match(m: re.Match, default_year: int):
-    y1, mo1, d1, ampm1, h1, mi1, y2, mo2, d2, ampm2, h2, mi2 = m.groups()
-    y1 = int(y1) if y1 else default_year
-    y2 = int(y2) if y2 else y1
-
-    mo1, d1 = int(mo1), int(d1)
-    mo2, d2 = int(mo2), int(d2)
-
-    h1 = int(h1)
-    h2 = int(h2)
-    mi1 = int(mi1) if mi1 is not None else 0
-    mi2 = int(mi2) if mi2 is not None else 0
-
-    H1, M1 = _parse_ko_time(ampm1, h1, mi1)
-    H2, M2 = _parse_ko_time(ampm2, h2, mi2)
-
-    start_date = _to_iso_date(y1, mo1, d1)
-    end_date = _to_iso_date(y2, mo2, d2)
-    start_time = _to_hhmm(H1, M1)
-    end_time = _to_hhmm(H2, M2)
-    return start_date, end_date, start_time, end_time
-
-
-def _parse_num_date_time_range_match(m: re.Match):
-    y1, mo1, d1, h1, mi1, y2, mo2, d2, h2, mi2 = m.groups()
-    start_date = _to_iso_date(int(y1), int(mo1), int(d1))
-    end_date = _to_iso_date(int(y2), int(mo2), int(d2))
-    start_time = _to_hhmm(int(h1), int(mi1))
-    end_time = _to_hhmm(int(h2), int(mi2))
-    return start_date, end_date, start_time, end_time
 
 
 def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
@@ -447,37 +476,37 @@ def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
     ISO 8601 스펙:
     {
       title: str,
-      start_date: "YYYY-MM-DD" | None,
-      end_date: "YYYY-MM-DD" | None,
-      start_time: "HH:MM" | None,
-      end_time: "HH:MM" | None,
+      start_date: "YYYY-MM-DD" | "",
+      end_date: "YYYY-MM-DD" | "",
+      start_time: "HH:MM" | "",
+      end_time: "HH:MM" | "",
       timezone: "Asia/Seoul",
       all_day: bool
     }
 
     정책:
-    - '등록/신청/접수/마감/기간/기한' 키워드가 붙은 날짜+시간 "범위"를 최우선으로 캘린더 일정으로 선택
-    - 범위가 없으면 기존 방식(첫 날짜/시간) fallback
-    - 날짜만 있고 시간이 없으면 all_day=True
-    - 날짜가 하나도 없으면 일정이 아니라고 보고, title 포함 전부 빈 값으로 반환(프론트 혼란 방지)
-    - title은 LLM로 생성(캘린더용), 실패/빈값이면 규칙 기반 fallback
+    - 범위(기간) 먼저: 날짜+시간 2개가 있는 범위를 우선
+    - 그 다음: 한 날짜 + 시간 범위
+    - 그 다음: 날짜만 있으면 all_day=True
+    - 날짜가 없으면 "빈 일정"으로 반환(프론트에서 일정 추가 막기 쉬움)
+    - null(None) 값은 절대 반환하지 않음 (모든 필드를 문자열/불리언으로)
     """
     now_year = datetime.now().year
+    src = text or ""
 
-    # 1) 기간(범위) 우선 파싱
     start_date = end_date = start_time = end_time = None
 
-    ko_matches = list(KO_DATE_TIME_RANGE_PAT.finditer(text or ""))
-    num_matches = list(NUM_DATE_TIME_RANGE_PAT.finditer(text or ""))
+    # 1) 범위 우선 (한국어/숫자)
+    ko_matches = list(KO_DATE_TIME_RANGE_PAT.finditer(src))
+    num_matches = list(NUM_DATE_TIME_RANGE_PAT.finditer(src))
 
     picked = None
     picked_kind = None
-
     if ko_matches:
-        picked = _pick_best_match(text, ko_matches)
+        picked = _pick_best_match(src, ko_matches)
         picked_kind = "ko"
     elif num_matches:
-        picked = _pick_best_match(text, num_matches)
+        picked = _pick_best_match(src, num_matches)
         picked_kind = "num"
 
     if picked is not None:
@@ -489,12 +518,19 @@ def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
         except Exception:
             start_date = end_date = start_time = end_time = None
 
-    # 2) fallback: 기존 방식
+    # 2) 한 날짜 + 24h 시간 범위 (예: 2025-12-15(월) 09:00 ~ 10:00)
     if start_date is None:
-        # dates 수집
+        m = ONE_DATE_24H_TIME_RANGE_PAT.search(src)
+        if m:
+            sd, ed, st, et = _parse_one_date_24h_time_range_match(m, default_year=now_year)
+            if sd:
+                start_date, end_date, start_time, end_time = sd, ed, st, et
+
+    # 3) 날짜들 수집 (요일/괄호/마침표 포함 토큰도 처리)
+    if start_date is None:
         date_hits: List[str] = []
         for p in DATE_PATS:
-            date_hits += p.findall(text or "")
+            date_hits += p.findall(src)
 
         iso_dates: List[str] = []
         for dh in date_hits:
@@ -505,69 +541,69 @@ def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
         start_date = iso_dates[0] if len(iso_dates) >= 1 else None
         end_date = iso_dates[1] if len(iso_dates) >= 2 else start_date
 
-        # time 파싱
-        m = ISO_TIME_PAT.search(text or "")
-        if m:
-            ampm1, h1, mi1, _, ampm2, h2, mi2 = m.groups()
-            h1 = int(h1)
-            h2 = int(h2)
-            mi1 = int(mi1) if mi1 is not None else 0
-            mi2 = int(mi2) if mi2 is not None else 0
-            H1, M1 = _parse_ko_time(ampm1, h1, mi1)
-            H2, M2 = _parse_ko_time(ampm2, h2, mi2)
-            start_time = _to_hhmm(H1, M1)
-            end_time = _to_hhmm(H2, M2)
+        # 시간 범위도 있으면 잡기 (24h)
+        mt24 = TIME_24H_RANGE_PAT.search(src)
+        if mt24:
+            h1, mi1, h2, mi2 = mt24.groups()
+            start_time = _to_hhmm(int(h1), int(mi1))
+            end_time = _to_hhmm(int(h2), int(mi2))
         else:
-            ms = ISO_TIME_SIMPLE.search(text or "")
-            if ms:
-                ampm1, h1, _, ampm2, h2 = ms.groups()
-                h1 = int(h1)
-                h2 = int(h2)
-                H1, M1 = _parse_ko_time(ampm1, h1, 0)
-                H2, M2 = _parse_ko_time(ampm2, h2, 0)
+            # 오전/오후 시간 범위
+            mk = KO_TIME_RANGE_PAT.search(src)
+            if mk:
+                ampm1, h1, mi1, _, ampm2, h2, mi2 = mk.groups()
+                h1 = int(h1); h2 = int(h2)
+                mi1 = int(mi1) if mi1 is not None else 0
+                mi2 = int(mi2) if mi2 is not None else 0
+                H1, M1 = _parse_ko_time(ampm1, h1, mi1)
+                H2, M2 = _parse_ko_time(ampm2, h2, mi2)
                 start_time = _to_hhmm(H1, M1)
                 end_time = _to_hhmm(H2, M2)
 
-    # ✅ PATCH: 날짜가 없으면 일정이 아닌 것으로 처리 (title도 비움)
+    # 날짜가 없으면: 빈 일정(단, null은 쓰지 않음)
     if not start_date:
         return {
             "title": "",
-            "start_date": None,
-            "end_date": None,
-            "start_time": None,
-            "end_time": None,
+            "start_date": "",
+            "end_date": "",
+            "start_time": "",
+            "end_time": "",
             "timezone": KST_TZ,
             "all_day": False,
         }
 
-    # all_day 정책
-    all_day = bool(start_date and (start_time is None and end_time is None))
+    # all_day
+    all_day = bool(start_date and (not start_time) and (not end_time))
 
-    # title (fallback 먼저)
-    fallback_title = _fallback_title_rule(text)
-    title = fallback_title
+    # title 생성: 규칙 기반 -> (가능하면) LLM
+    title = _fallback_title_rule(src)
 
-    # 날짜가 있는 경우(여기까지 왔으면 있음) LLM로 제목 생성 시도
     if client is not None:
         try:
-            llm_title = llm_schedule_title(text, client)
+            llm_title = llm_schedule_title(src, client)
             if llm_title:
                 title = llm_title
         except Exception:
-            title = fallback_title
+            pass
+
+    # --- null 제거: None이면 무조건 "" 로 치환 ---
+    def _nz(x: Optional[str]) -> str:
+        return x if isinstance(x, str) and x is not None else ""
 
     return {
         "title": (title or "")[:120],
-        "start_date": start_date,
-        "end_date": end_date,
-        "start_time": start_time,
-        "end_time": end_time,
+        "start_date": _nz(start_date),
+        "end_date": _nz(end_date),
+        "start_time": _nz(start_time),
+        "end_time": _nz(end_time),
         "timezone": KST_TZ,
-        "all_day": all_day,
+        "all_day": bool(all_day),
     }
 
 
-# LLM Prompting
+# -----------------------------
+# LLM summarization
+# -----------------------------
 PROMPT_TEMPLATE = """
 당신은 한국어 'AI 문서 해설사'입니다.
 입력 문서를 어르신이 이해하기 쉽게 요약(핵심,행동안내)으로 변환하세요.
@@ -623,7 +659,9 @@ def llm_summarize(doc_text: str, doc_type: str, client) -> Dict:
     return data
 
 
+# -----------------------------
 # TTS
+# -----------------------------
 def tts_bytes_ko(text: str) -> bytes:
     txt = (text or "").strip() or "읽을 내용이 없습니다. 다시 시도해 주세요."
     tts = gTTS(text=txt, lang="ko")
@@ -632,7 +670,9 @@ def tts_bytes_ko(text: str) -> bytes:
     return buf.getvalue()
 
 
+# -----------------------------
 # Pipeline
+# -----------------------------
 def process_image_bytes(
     image_bytes: bytes,
     gcp_key: Optional[str] = None,
@@ -645,11 +685,9 @@ def process_image_bytes(
 
     tags = extract_tags(full_text)
 
-    # 일정 추출 (ISO + LLM title)
     schedule_legacy = extract_schedule(full_text)
     schedule_iso = extract_schedule_iso(full_text, client=o_client)
 
-    # 정보부족 처리
     low = is_low_info(full_text, tags)
     if low:
         summary = {
@@ -663,7 +701,6 @@ def process_image_bytes(
         }
     else:
         summary = llm_summarize(full_text, doc_type, o_client)
-        # 모델이 과하게 말했을 가능성 최소화: 본문에 없는 숫자 URL이 다수인 경우 제약
         if len(summary.get("bullets", [])) == 0 and len(summary.get("next_actions", [])) == 0:
             summary["need_more_info"] = True
             if not summary.get("ask_back"):
@@ -675,8 +712,6 @@ def process_image_bytes(
         "boxes": boxes,
         "tags": tags,
         "summary": summary,
-
-        # (ISO 8601 + 캘린더용 title)
         "schedule_suggestion": schedule_iso,
         "schedule_suggestion_legacy": schedule_legacy,
     }
