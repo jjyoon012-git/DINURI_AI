@@ -1,0 +1,5 @@
+# Google API / Service Account keys
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json

@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pillow
+google-cloud-vision
+google-auth
+google-api-core
+gTTS
+openai>=1.0.0
+python-dotenv
+packaging
+python-multipart
