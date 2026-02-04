@@ -1,11 +1,5 @@
-# 0204
-# 계좌 로직 업뎃2:
-# - 계좌 후보는 "POS 키워드(계좌/가상계좌/납부/입금/은행/예금주 등) + 은행 단서"가
-#   같은 근처 문맥(window)에 동시에 존재할 때만 "추출" (후보 리스트에 포함)
-# - 문서번호/접수번호/승인번호/관리번호 주변이면 무조건 차단
-# - 단독 계좌 예외(SINGLETON)는 계좌에 대해 완전 비활성화
-# - 계좌 후보는 서버에서 재검증(normalize + plausibility + context score + must conditions) 후에만 버튼 생성
-# ai_doc_helper2_strict.py
+# 0204: 계좌 엄격 3트 (ULTRA STRICT)
+# Google Cloud Vision OCR + OpenAI GPT-4o-mini + gTTS
 
 from dotenv import load_dotenv
 import io
@@ -31,10 +25,8 @@ except Exception:
 from gtts import gTTS
 from datetime import datetime
 
-# DNS resolver
 os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
 
-# env
 # tmux/서버 환경에서 예전 export 키가 .env를 덮는 문제를 줄이려면 override=True 권장
 load_dotenv(override=True)
 
@@ -106,6 +98,8 @@ def draw_boxes(pil_img: Image.Image, boxes: List[List[Tuple[int, int]]], stroke:
 # Tag extraction (regex)
 # ============================================================
 
+PHONE_PAT_STRICT = re.compile(r"\b0\d{1,2}-\d{3,4}-\d{4}\b")
+
 TAG_REGEX = {
     "날짜": [
         r"\b20\d{2}[./-]\d{1,2}[./-]\d{1,2}(?:\.)?(?:\([월화수목금토일]\))?\b",
@@ -120,11 +114,12 @@ TAG_REGEX = {
         r"\b0\d{1,2}-\d{3,4}-\d{4}\b",
         r"\b0\d{9,10}\b"
     ],
-    # 계좌는 "후보 추출"로만 쓰고, UI 버튼은 서버에서 재검증 + 문맥강제
-    # (패턴 자체는 넓게 두되, 후속 엄격 필터가 핵심)
+    # 계좌는 후보 추출만: 최종 버튼은 서버의 strict recheck + bank name mandatory를 통과해야 생성
     "계좌": [
-        r"\b\d{2,3}-\d{2,6}-\d{2,6}-?\d{0,6}\b",
-        r"\b계좌(?:번호)?\s*[:：]?\s*\d[\d-]{6,}\b"
+        # 하이픈 숫자열 후보 (후속 필터에서 2-4-4/2-3-4/3-4-4, phone-like 강차단 + bank+context 강제)
+        r"\b\d{2,4}-\d{2,6}-\d{2,8}(?:-\d{1,6})?\b",
+        # '계좌번호:' 같은 명시 후보 (그래도 은행명 강제)
+        r"\b계좌(?:번호)?\s*[:：]?\s*\d[\d-]{9,}\b"
     ],
     "기간/마감": [
         r"(접수|신청|납부|마감|기한|유효)[:：]?\s*[~\-]?\s*\d{0,4}[./-]?\d{1,2}[./-]?\d{1,2}",
@@ -149,6 +144,174 @@ def _compile_patterns():
 _COMPILED = _compile_patterns()
 
 
+# ============================================================
+# Account/Phone strict helpers (핵심: bank mandatory + shape exclusion)
+# ============================================================
+
+ACCOUNT_POS_KWS = ["계좌", "계좌번호", "가상계좌", "입금", "송금", "납부", "이체", "은행", "예금주", "수취"]
+ACCOUNT_NEG_KWS = ["문서번호", "접수번호", "승인번호", "관리번호", "고객번호", "주문번호", "운송장", "송장", "청구번호"]
+
+# 전화 문맥이 근처면 계좌 차단(“전화번호가 계좌로 추출” 방지)
+ACCOUNT_PHONE_NEG_KWS = ["전화", "문의", "연락", "고객센터", "대표번호", "상담", "ARS", "내선", "FAX", "팩스"]
+
+BANK_NAME_KWS = [
+    "국민", "신한", "우리", "하나", "농협", "기업", "카카오뱅크", "토스뱅크",
+    "새마을", "우체국", "수협", "대구", "부산", "광주", "전북", "경남", "SC", "씨티"
+]
+
+# 계좌로 절대 허용하지 않을 하이픈 형태
+EXCLUDE_HYPHEN_SHAPES = {(2, 4, 4), (2, 3, 4), (3, 4, 4)}
+
+
+def normalize_digits_hyphen(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"[^\d-]", "", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s
+
+
+def _window(text: str, token: str, radius: int = 160) -> str:
+    if not text or not token:
+        return ""
+    idx = (text or "").find(token)
+    if idx == -1:
+        return ""
+    return (text or "")[max(0, idx - radius): min(len(text or ""), idx + len(token) + radius)]
+
+
+def _has_any(text: str, kws: List[str]) -> bool:
+    t = text or ""
+    return any(k in t for k in kws)
+
+
+def is_phone_like(raw: str) -> bool:
+    if not raw:
+        return False
+
+    s = raw.strip()
+
+    # 하이픈 전화
+    if PHONE_PAT_STRICT.search(s):
+        return True
+
+    # 숫자만 전화(0으로 시작 10~11자리)
+    digits = re.sub(r"\D", "", s)
+    if len(digits) in (10, 11) and digits.startswith("0"):
+        return True
+
+    return False
+
+
+def is_excluded_hyphen_shape(raw: str) -> bool:
+    s = normalize_digits_hyphen(raw)
+    parts = s.split("-") if s else []
+    if len(parts) == 3:
+        shape = (len(parts[0]), len(parts[1]), len(parts[2]))
+        return shape in EXCLUDE_HYPHEN_SHAPES
+    return False
+
+
+def _account_context_gate(text: str, token: str) -> bool:
+    """
+    계좌 후보가 '계좌'로 인정되려면:
+    - 은행명 1개 이상 + 계좌 문맥 1개 이상이 같은 window에 존재
+    - 문서번호류/전화문맥 있으면 즉시 차단
+    """
+    win = _window(text, token, radius=220)
+    if not win:
+        return False
+
+    if _has_any(win, ACCOUNT_NEG_KWS):
+        return False
+    if _has_any(win, ACCOUNT_PHONE_NEG_KWS):
+        return False
+
+    has_bank = _has_any(win, BANK_NAME_KWS)
+    has_pos = _has_any(win, ACCOUNT_POS_KWS)
+
+    return bool(has_bank and has_pos)
+
+
+def is_plausible_korean_account(raw: str) -> bool:
+    """
+    Ultra strict format filter:
+    - phone-like 차단
+    - 2-4-4 / 2-3-4 / 3-4-4 차단
+    - 하이픈 포함
+    - digits 길이 9~16
+    - 파트 최소 길이 2
+    """
+    if is_phone_like(raw):
+        return False
+    if is_excluded_hyphen_shape(raw):
+        return False
+
+    s = normalize_digits_hyphen(raw)
+    if "-" not in s:
+        return False
+
+    digits = re.sub(r"-", "", s)
+    if not (9 <= len(digits) <= 16):
+        return False
+
+    parts = s.split("-")
+    if any(len(p) < 2 for p in parts):
+        return False
+
+    return True
+
+
+def ctx_score_account(text: str, token: str) -> float:
+    """
+    점수는 사실상 gate로 쓴다:
+    - 은행명+계좌문맥이 있으면 0.90 이상
+    - 그 외는 0.0
+    """
+    win = _window(text, token, radius=240)
+    if not win:
+        return 0.0
+
+    if _has_any(win, ACCOUNT_NEG_KWS):
+        return 0.0
+    if _has_any(win, ACCOUNT_PHONE_NEG_KWS):
+        return 0.0
+
+    pos = sum(1 for k in ACCOUNT_POS_KWS if k in win)
+    bank = sum(1 for k in BANK_NAME_KWS if k in win)
+
+    if pos < 1 or bank < 1:
+        return 0.0
+
+    # 최소 요건만 만족해도 0.90 (THRESH_ACCOUNT 통과)
+    score = 0.0
+    score += 0.45  # pos 존재
+    score += 0.45  # bank 존재
+    if pos >= 2:
+        score += 0.10
+    return max(0.0, min(1.0, score))
+
+
+def _filter_account_candidates_in_tags(full_text: str, cands: List[str]) -> List[str]:
+    """
+    tags 단계에서도 계좌 후보를 최대한 줄여서 LLM 오염 방지.
+    (최종 UI는 validate 단계에서 다시 strict recheck)
+    """
+    out: List[str] = []
+    for c in cands or []:
+        if is_phone_like(c):
+            continue
+        if is_excluded_hyphen_shape(c):
+            continue
+        if not is_plausible_korean_account(c):
+            continue
+        if not _account_context_gate(full_text, c):
+            continue
+        norm = normalize_digits_hyphen(c)
+        if norm and norm not in out:
+            out.append(norm)
+    return out
+
+
 def extract_tags(text: str) -> Dict[str, List[str]]:
     found: Dict[str, List[str]] = {k: [] for k in list(TAG_REGEX.keys()) + list(TAG_KEYWORDS.keys())}
     for tag, patterns in _COMPILED.items():
@@ -157,10 +320,16 @@ def extract_tags(text: str) -> Dict[str, List[str]]:
                 s = m if isinstance(m, str) else (m[0] if m else "")
                 if s and s not in found[tag]:
                     found[tag].append(s)
+
     for tag, kws in TAG_KEYWORDS.items():
         for k in kws:
             if (text or "").find(k) != -1 and k not in found[tag]:
                 found[tag].append(k)
+
+    # 계좌 태그는 여기서 1차로 강하게 줄인다(은행명+문맥 필수)
+    if found.get("계좌"):
+        found["계좌"] = _filter_account_candidates_in_tags(text or "", found["계좌"])
+
     return {k: v for k, v in found.items() if v}
 
 
@@ -447,7 +616,6 @@ OCR 텍스트:
         return ""
 
     title = (data.get("title") or "").strip()
-
     if len(title) > 40:
         return ""
     if sum(1 for ch in title if ch in [",", ".", "，", "。", ":", ";"]) >= 2:
@@ -514,7 +682,8 @@ def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
             mk = KO_TIME_RANGE_PAT.search(src)
             if mk:
                 ampm1, h1, mi1, _, ampm2, h2, mi2 = mk.groups()
-                h1 = int(h1); h2 = int(h2)
+                h1 = int(h1)
+                h2 = int(h2)
                 mi1 = int(mi1) if mi1 is not None else 0
                 mi2 = int(mi2) if mi2 is not None else 0
                 H1, M1 = _parse_ko_time(ampm1, h1, mi1)
@@ -566,7 +735,7 @@ PROMPT_TEMPLATE = """
 당신은 한국어 'AI 문서 해설사'입니다.
 입력 문서를 어르신이 이해하기 쉽게 요약(핵심,행동안내)으로 변환하세요.
 정보가 부족하면 요약을 만들지 말고, 사용자에게 물어볼 질문을 제안하세요.
-귀여운 손주가 존댓말로 친근하게 설명합니다.
+친근한 존댓말로 설명합니다.
 
 문서 유형: {doc_type}
 본문:
@@ -632,51 +801,25 @@ def tts_bytes_ko(text: str) -> bytes:
 
 
 # ============================================================
-# Action Planning (오탐 최소화 정책) - STRICT ACCOUNT
+# Action Planning (ultra-strict account)
 # ============================================================
-
-ACTION_TYPES = ["call", "copy_account", "create_calendar"]
 
 CALL_HINTS = ["문의", "연락", "전화", "고객센터", "대표번호", "콜센터", "상담", "ARS", "내선", "FAX", "팩스"]
 CAL_EVENT_HINTS = ["등록", "신청", "접수", "제출", "납부", "마감", "기한", "기간", "예약", "검사", "면접", "설명회", "오리엔테이션"]
 CAL_NEG_HINTS = ["발행", "발급", "작성", "출력", "고지", "청구"]
 
-# 계좌 관련: "엄격" (문맥 강제)
-ACCOUNT_POS_KWS = ["계좌", "계좌번호", "가상계좌", "입금", "송금", "납부", "이체", "은행", "예금주", "수취"]
-ACCOUNT_NEG_KWS = ["문서번호", "접수번호", "승인번호", "관리번호", "고객번호", "주문번호", "운송장", "송장", "청구번호"]
-BANK_KWS = [
-    "국민", "신한", "우리", "하나", "농협", "기업", "카카오뱅크", "토스뱅크",
-    "새마을", "우체국", "수협", "대구", "부산", "광주", "전북", "경남", "SC", "씨티"
-]
-# 은행 단서 확장: 은행명이 없더라도 "은행"이라는 단어가 근처에 있으면 bank 단서로 인정
-BANK_GENERIC_KWS = ["은행", "뱅크"]
+ACTION_TYPES = ["call", "copy_account", "create_calendar"]
 
-# 오탐 최소화: 기본 임계값
 THRESH_CALL = 0.60
-THRESH_ACCOUNT = 0.78   # 엄격
+THRESH_ACCOUNT = 0.90
 THRESH_CAL = 0.70
 
-# 단독 값 예외:
 ENABLE_SINGLETON_EXCEPTION_CALL = True
 ENABLE_SINGLETON_EXCEPTION_ACCOUNT = False
 
 SINGLETON_MAX_LEN = 180
 SINGLETON_CONF_MAX = 0.55
 SINGLETON_MIN = 0.45
-
-
-def _window(text: str, token: str, radius: int = 80) -> str:
-    if not text or not token:
-        return ""
-    idx = text.find(token)
-    if idx == -1:
-        return ""
-    return text[max(0, idx - radius): min(len(text), idx + len(token) + radius)]
-
-
-def _has_any(text: str, kws: List[str]) -> bool:
-    t = text or ""
-    return any(k in t for k in kws)
 
 
 def _ctx_score(text: str, token: str, hints: List[str]) -> float:
@@ -690,81 +833,25 @@ def _ctx_score(text: str, token: str, hints: List[str]) -> float:
     return min(1.0, score / 4.0)
 
 
-def normalize_digits_hyphen(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"[^\d-]", "", s)
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    return s
-
-
-def is_plausible_korean_account(raw: str) -> bool:
-    """
-    계좌형식 1차 필터 (더 보수적으로 조정):
-    - 하이픈 포함 (문서번호류도 하이픈이 많지만, 후속 문맥 필터가 핵심)
-    - 전체 숫자 길이 10~15 (너무 짧/너무 길면 배제)
-    - 파트 최소 길이 2 이상
-    """
-    s = normalize_digits_hyphen(raw)
-    if "-" not in s:
-        return False
-    digits = re.sub(r"-", "", s)
-    if not (10 <= len(digits) <= 15):
-        return False
-    parts = s.split("-")
-    if any(len(p) < 2 for p in parts):
-        return False
-    return True
-
-
-def ctx_score_account(text: str, token: str) -> float:
-    """
-    [초엄격 정책]
-    - POS 단서 >=1 AND BANK 단서 >=1 이 없으면 0점(=사실상 계좌로 인정 안 함)
-    - NEG 단서 있으면 0점
-    - 나머지에서만 점수 계산
-    """
-    win = _window(text, token, radius=140)
-    if not win:
-        return 0.0
-
-    # neg가 있으면 즉시 차단
-    if _has_any(win, ACCOUNT_NEG_KWS):
-        return 0.0
-
-    pos = sum(1 for k in ACCOUNT_POS_KWS if k in win)
-    bank = sum(1 for k in BANK_KWS if k in win) + sum(1 for k in BANK_GENERIC_KWS if k in win)
-
-    # ✅ 핵심: 둘 다 있어야만 "계좌 문맥" 인정
-    if pos < 1 or bank < 1:
-        return 0.0
-
-    # 보수적 가중: pos, bank만 반영 (neg는 위에서 컷)
-    score = 0.0
-    score += min(1.0, pos / 3.0) * 0.75
-    score += min(1.0, bank / 1.0) * 0.25
-    return max(0.0, min(1.0, score))
-
-
 def extract_account_candidates_strict(doc_text: str, raw_candidates: List[str]) -> List[str]:
     """
-    tags의 '계좌' 후보를 그대로 쓰지 않고 서버에서 재검증.
-
-    [초엄격 정책]
-    - plausibility 통과
-    - ctx_score_account()가 0이 아니어야 함 (= POS>=1 & BANK>=1 & NEG=0)
-    - ctx_score_account() >= 0.78 (THRESH_ACCOUNT와 동일 기준으로 올림)
-    - normalize + dedup
-
-    => "관련 키워드 + 은행 단서"가 없으면 후보 리스트에 아예 들어가지 않음.
+    서버 최종 strict 후보:
+    - phone-like/2-4-4/2-3-4/3-4-4 제외
+    - format plausibility
+    - 은행명+계좌문맥 반드시 존재
+    - neg/전화문맥 있으면 차단
+    - ctx_score_account >= THRESH_ACCOUNT
     """
     out: List[str] = []
     for c in raw_candidates or []:
+        if is_phone_like(c):
+            continue
+        if is_excluded_hyphen_shape(c):
+            continue
         if not is_plausible_korean_account(c):
             continue
 
         sc = ctx_score_account(doc_text, c)
-        if sc <= 0.0:
-            continue
         if sc < THRESH_ACCOUNT:
             continue
 
@@ -808,17 +895,15 @@ def llm_action_plan(
     client
 ) -> Dict[str, Any]:
     """
-    오탐 최소화 프롬프트 (엄격 계좌 버전):
-    - 후보 리스트에서 pick만 가능
-    - 계좌는 '강한 문맥'이 있을 때만 허용(LLM에게도 강제)
-    - 캘린더는 이벤트 단서 없으면 금지
+    LLM은 후보를 고르는 역할만.
+    계좌는 후보 리스트에 있어도 서버 strict에서 다시 걸러진다.
     """
     phone_cands = tags.get("전화번호", []) if tags else []
     acct_raw = tags.get("계좌", []) if tags else []
     has_sched = bool((schedule_iso or {}).get("start_date"))
 
     phone_payload = [{"value": p, "context": _window(doc_text, p, 80)} for p in phone_cands]
-    acct_payload = [{"value": a, "context": _window(doc_text, a, 140)} for a in acct_raw]
+    acct_payload = [{"value": a, "context": _window(doc_text, a, 220)} for a in acct_raw]
 
     payload = {
         "doc_len": len((doc_text or "").strip()),
@@ -829,55 +914,37 @@ def llm_action_plan(
     }
 
     prompt = f"""
-역할: OCR 문서에서 실행 버튼(통화/계좌복사/캘린더)을 "오탐 최소화" 원칙으로 매우 보수적으로 제안한다.
+역할: OCR 문서에서 실행 버튼(통화/계좌복사/캘린더)을 매우 보수적으로 제안한다.
 
-절대 규칙:
+규칙:
 1) 새로운 전화번호/계좌/날짜/시간/금액을 절대로 만들어내지 마라.
 2) 아래 후보 리스트에 있는 항목만 선택할 수 있다. 선택은 index(pick)로만 한다.
 3) 확실하지 않으면 actions를 비우고 need_more_info=true + 질문을 만든다.
 4) actions는 최대 2개.
-5) confidence는 0.0~1.0 (보수적으로). 애매하면 낮게.
+5) confidence는 0.0~1.0. 애매하면 낮게.
 
-허용되는 action type:
-- "call"         (phone_candidates에서 pick=int)
+허용 action type:
+- "call" (phone_candidates에서 pick=int)
 - "copy_account" (account_candidates에서 pick=int)
 - "create_calendar" (pick="schedule"; schedule_candidate가 있을 때만)
 
-판단 규칙(엄격):
-A) call:
-  - 후보 주변 context에 "문의/연락/고객센터/대표번호/상담/ARS/FAX" 단서가 있으면 허용(고신뢰)
-  - 단서가 거의 없으면 금지하되,
-    '단독 전화 예외'만 매우 제한적으로 허용:
-      * phone 후보가 정확히 1개
-      * 문서가 매우 짧음(doc_len <= {SINGLETON_MAX_LEN})
-      * schedule_candidate가 없음
-    => 이때만 confidence 0.45~0.55
-
-B) copy_account (매우 엄격):
-  - 후보 주변 context에 반드시 아래 중 1개 이상이 있어야 한다:
-      "계좌", "계좌번호", "가상계좌", "입금", "납부", "이체", "은행", "예금주"
-  - 그리고 "은행명/은행/뱅크" 단서도 반드시 있어야 한다.
-  - 그리고 아래가 보이면 무조건 금지:
-      "문서번호", "접수번호", "승인번호", "관리번호", "고객번호", "주문번호"
-  - 단독 계좌 예외는 절대 금지(문맥 없으면 무조건 actions에서 제외)
-
-C) create_calendar:
-  - schedule_candidate가 있어도, "등록/신청/접수/제출/납부/마감/예약/면접" 같은 이벤트 단서가 보일 때만 허용.
-  - 단독 날짜(발행/고지/작성일)는 금지.
+copy_account(초엄격):
+- 후보 주변에 은행명이 반드시 있어야 한다.
+- 후보 주변에 계좌/가상계좌/입금/납부/이체/예금주 같은 계좌 문맥이 있어야 한다.
+- 후보 주변에 전화/ARS/FAX/문의/고객센터 단서가 있으면 금지.
+- 문서번호/접수번호/승인번호/관리번호 주변이면 금지.
+- 단독 계좌 예외는 금지.
 
 출력(JSON만):
 {{
   "actions":[
-    {{"type":"call","pick":0,"confidence":0.8,"reason":"고객센터 단서"}},
-    {{"type":"copy_account","pick":0,"confidence":0.8,"reason":"납부/가상계좌"}}
+    {{"type":"call","pick":0,"confidence":0.8,"reason":"문의"}},
+    {{"type":"copy_account","pick":0,"confidence":0.6,"reason":"은행명"}}
   ],
   "need_more_info": false,
   "ask_back": []
 }}
 
-주의:
-- reason은 20자 이내로 짧게.
-- JSON 이외 텍스트 금지.
 입력:
 {json.dumps(payload, ensure_ascii=False)}
 """.strip()
@@ -917,14 +984,14 @@ def validate_and_build_actions(
     llm_plan: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    서버 최종 게이트(오탐 최소화) - STRICT ACCOUNT (초엄격):
-    - account: (1) plausibility (2) NEG 즉시 차단 (3) POS>=1 & BANK>=1 필수 (4) context_score >= THRESH_ACCOUNT
+    서버 최종 게이트:
+    - 계좌: strict 후보 리스트만 인정 (은행명+문맥 필수 + 2-4-4/2-3-4/3-4-4/phone-like 차단)
+    - 전화/캘린더는 기존 정책 유지
     """
     phone_cands = tags.get("전화번호", []) if tags else []
     acct_raw = tags.get("계좌", []) if tags else []
     has_sched = bool((schedule_iso or {}).get("start_date"))
 
-    # ✅ 계좌 후보를 서버에서 "초엄격 재검증"한 리스트로 교체
     acct_cands_strict = extract_account_candidates_strict(doc_text, acct_raw)
 
     actions_out: List[Dict[str, Any]] = []
@@ -957,7 +1024,7 @@ def validate_and_build_actions(
             if final_conf < THRESH_CALL:
                 if _singleton_exception_ok_call(doc_text, phone_cands, has_sched):
                     final_conf = max(SINGLETON_MIN, min(SINGLETON_CONF_MAX, max(final_conf, 0.50)))
-                    reason = reason or "단독 전화 예외"
+                    reason = reason or "단독 전화"
                 else:
                     continue
 
@@ -974,29 +1041,28 @@ def validate_and_build_actions(
             })
 
         elif atype == "copy_account":
-            # ✅ 서버에서는 strict 후보 리스트가 비어 있으면 무조건 차단
+            # strict 후보만 인정
             if not acct_cands_strict:
                 continue
-
-            # LLM pick은 acct_raw 인덱스 기반이므로 범위 검증
             if not isinstance(pick, int) or pick < 0 or pick >= len(acct_raw):
                 continue
 
             raw = acct_raw[pick]
+
+            if is_phone_like(raw):
+                continue
+            if is_excluded_hyphen_shape(raw):
+                continue
+
             norm = normalize_digits_hyphen(raw)
-            if not norm:
+            if not norm or norm not in acct_cands_strict:
                 continue
 
-            # ✅ strict 후보에 포함된 것만 허용
-            if norm not in acct_cands_strict:
-                continue
-
-            # 추가 방어: 최종 컨텍스트 점수 재계산(0이면 즉시 컷)
             ctx = ctx_score_account(doc_text, raw)
             if ctx < THRESH_ACCOUNT:
                 continue
 
-            final_conf = min(conf if conf > 0 else 0.85, 0.95) * (0.60 + 0.40 * ctx)
+            final_conf = min(conf if conf > 0 else 0.90, 0.95) * (0.80 + 0.20 * ctx)
             if final_conf < THRESH_ACCOUNT:
                 continue
 
@@ -1005,9 +1071,9 @@ def validate_and_build_actions(
                 "label": "계좌 복사",
                 "evidence": {
                     "account": norm,
-                    "source": "tags.계좌 (strict_recheck)",
+                    "source": "tags.계좌 (ultra_strict_recheck)",
                     "context_score": round(ctx, 3),
-                    "reason": (reason or "계좌/은행 단서")[:20],
+                    "reason": (reason or "은행명+문맥")[:20],
                 },
                 "confidence": round(final_conf, 3),
             })
@@ -1051,7 +1117,7 @@ def validate_and_build_actions(
                     },
                     "source": "extract_schedule_iso",
                     "context_score": round(ctx, 3),
-                    "reason": (reason or "이벤트 단서")[:20],
+                    "reason": (reason or "이벤트")[:20],
                 },
                 "confidence": round(final_conf, 3),
             })
@@ -1073,14 +1139,14 @@ def validate_and_build_actions(
         if (not phone_cands) and (not acct_raw) and (not has_sched):
             need_more_info = True
             ask_back = [
-                "이 문서에서 하려는 일이 '전화', '입금/납부', '일정 추가' 중 무엇인가요?",
+                "이 문서에서 하려는 일이 전화, 입금/납부, 일정 추가 중 무엇인가요?",
                 "가능하면 문서의 핵심 문장을 한 줄만 알려주세요.",
             ]
         else:
             need_more_info = True
             ask_back = [
-                "이 번호/계좌가 실제로 '연락' 또는 '입금/납부' 용도 맞나요?",
-                "맞다면 '은행명/은행', '납부', '가상계좌', '계좌번호' 같은 단서가 있는 부분을 같이 알려주시면 정확도가 올라가요.",
+                "이 정보가 실제로 입금/납부용 계좌가 맞나요?",
+                "은행명과 납부/입금 문구가 함께 있는 줄을 알려주시면 더 정확합니다.",
             ]
 
     return {
@@ -1125,7 +1191,7 @@ def process_image_bytes(
             "actions": [],
             "need_more_info": True,
             "ask_back": [
-                "통화/계좌복사/캘린더 중 무엇을 하려는지 알려주실 수 있을까요?",
+                "통화, 계좌복사, 캘린더 중 무엇을 하려는지 알려주실 수 있을까요?",
             ],
         }
     else:
@@ -1138,7 +1204,6 @@ def process_image_bytes(
         llm_plan = llm_action_plan(full_text, tags, schedule_iso, o_client)
         action_pack = validate_and_build_actions(full_text, tags, schedule_iso, llm_plan)
 
-        # action이 need_more_info면 summary에도 질문을 합쳐 UX 일관성 유지
         if action_pack.get("need_more_info") and not summary.get("need_more_info"):
             summary["need_more_info"] = True
 
@@ -1160,7 +1225,6 @@ def process_image_bytes(
         "schedule_suggestion": schedule_iso,
         "schedule_suggestion_legacy": schedule_legacy,
 
-        # 실행 버튼용(오탐 최소화)
         "ui_actions": action_pack.get("actions", []),
         "ui_actions_need_more_info": bool(action_pack.get("need_more_info", False)),
         "ui_actions_ask_back": action_pack.get("ask_back", []),
@@ -1172,7 +1236,7 @@ def build_tts_from_summary(summary: Dict, full_text: Optional[str] = None, mode:
         bullets = (summary or {}).get("bullets", [])
         acts = (summary or {}).get("next_actions", [])
         if (summary or {}).get("need_more_info"):
-            speak_text = "사진만으로는 정보가 부족해요. 문서 내용이나 일정의 제목, 날짜 범위, 시간 범위를 알려주시면 정확히 도와드릴게요."
+            speak_text = "사진만으로는 정보가 부족합니다. 문서 내용이나 일정의 제목, 날짜 범위, 시간 범위를 알려주시면 더 정확히 도와드릴게요."
         else:
             speak_text = " / ".join([*bullets, *acts]) or "요약이 비어 있습니다."
         return tts_bytes_ko(speak_text)
