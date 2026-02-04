@@ -1,11 +1,11 @@
 # 0204
-# 계좌 로직 업데이트:
-# - 계좌 UI 액션(copy_account)은 "계좌/가상계좌/납부/입금/은행/예금주" 등 강한 문맥이 있을 때만 허용
+# 계좌 로직 업뎃2:
+# - 계좌 후보는 "POS 키워드(계좌/가상계좌/납부/입금/은행/예금주 등) + 은행 단서"가
+#   같은 근처 문맥(window)에 동시에 존재할 때만 "추출" (후보 리스트에 포함)
 # - 문서번호/접수번호/승인번호/관리번호 주변이면 무조건 차단
 # - 단독 계좌 예외(SINGLETON)는 계좌에 대해 완전 비활성화
-# - 계좌 후보는 서버에서 재검증(normalize + plausibility + context score) 후에만 버튼 생성
+# - 계좌 후보는 서버에서 재검증(normalize + plausibility + context score + must conditions) 후에만 버튼 생성
 # ai_doc_helper2_strict.py
-# Google Cloud Vision OCR + OpenAI GPT-4o-mini + gTTS
 
 from dotenv import load_dotenv
 import io
@@ -121,6 +121,7 @@ TAG_REGEX = {
         r"\b0\d{9,10}\b"
     ],
     # 계좌는 "후보 추출"로만 쓰고, UI 버튼은 서버에서 재검증 + 문맥강제
+    # (패턴 자체는 넓게 두되, 후속 엄격 필터가 핵심)
     "계좌": [
         r"\b\d{2,3}-\d{2,6}-\d{2,6}-?\d{0,6}\b",
         r"\b계좌(?:번호)?\s*[:：]?\s*\d[\d-]{6,}\b"
@@ -647,15 +648,15 @@ BANK_KWS = [
     "국민", "신한", "우리", "하나", "농협", "기업", "카카오뱅크", "토스뱅크",
     "새마을", "우체국", "수협", "대구", "부산", "광주", "전북", "경남", "SC", "씨티"
 ]
+# 은행 단서 확장: 은행명이 없더라도 "은행"이라는 단어가 근처에 있으면 bank 단서로 인정
+BANK_GENERIC_KWS = ["은행", "뱅크"]
 
 # 오탐 최소화: 기본 임계값
 THRESH_CALL = 0.60
-THRESH_ACCOUNT = 0.78   # 엄격하게 올림
+THRESH_ACCOUNT = 0.78   # 엄격
 THRESH_CAL = 0.70
 
 # 단독 값 예외:
-# - 전화는 "단독 전화" 예외를 제한적으로 허용 가능
-# - 계좌는 단독 예외 완전 금지(엄격 버전 핵심)
 ENABLE_SINGLETON_EXCEPTION_CALL = True
 ENABLE_SINGLETON_EXCEPTION_ACCOUNT = False
 
@@ -698,16 +699,16 @@ def normalize_digits_hyphen(s: str) -> str:
 
 def is_plausible_korean_account(raw: str) -> bool:
     """
-    계좌형식 1차 필터 (보수적):
-    - 하이픈 포함
-    - 전체 숫자 길이 9~16
+    계좌형식 1차 필터 (더 보수적으로 조정):
+    - 하이픈 포함 (문서번호류도 하이픈이 많지만, 후속 문맥 필터가 핵심)
+    - 전체 숫자 길이 10~15 (너무 짧/너무 길면 배제)
     - 파트 최소 길이 2 이상
     """
     s = normalize_digits_hyphen(raw)
     if "-" not in s:
         return False
     digits = re.sub(r"-", "", s)
-    if not (9 <= len(digits) <= 16):
+    if not (10 <= len(digits) <= 15):
         return False
     parts = s.split("-")
     if any(len(p) < 2 for p in parts):
@@ -716,38 +717,57 @@ def is_plausible_korean_account(raw: str) -> bool:
 
 
 def ctx_score_account(text: str, token: str) -> float:
-    win = _window(text, token, radius=120)
+    """
+    [초엄격 정책]
+    - POS 단서 >=1 AND BANK 단서 >=1 이 없으면 0점(=사실상 계좌로 인정 안 함)
+    - NEG 단서 있으면 0점
+    - 나머지에서만 점수 계산
+    """
+    win = _window(text, token, radius=140)
     if not win:
         return 0.0
-    pos = sum(1 for k in ACCOUNT_POS_KWS if k in win)
-    bank = sum(1 for k in BANK_KWS if k in win)
-    neg = sum(1 for k in ACCOUNT_NEG_KWS if k in win)
 
-    # 보수적 가중
+    # neg가 있으면 즉시 차단
+    if _has_any(win, ACCOUNT_NEG_KWS):
+        return 0.0
+
+    pos = sum(1 for k in ACCOUNT_POS_KWS if k in win)
+    bank = sum(1 for k in BANK_KWS if k in win) + sum(1 for k in BANK_GENERIC_KWS if k in win)
+
+    # ✅ 핵심: 둘 다 있어야만 "계좌 문맥" 인정
+    if pos < 1 or bank < 1:
+        return 0.0
+
+    # 보수적 가중: pos, bank만 반영 (neg는 위에서 컷)
     score = 0.0
     score += min(1.0, pos / 3.0) * 0.75
     score += min(1.0, bank / 1.0) * 0.25
-    score -= min(1.0, neg / 1.0) * 0.95
     return max(0.0, min(1.0, score))
 
 
 def extract_account_candidates_strict(doc_text: str, raw_candidates: List[str]) -> List[str]:
     """
     tags의 '계좌' 후보를 그대로 쓰지 않고 서버에서 재검증.
-    - plausibility 통과 + context_score >= 0.60
-    - neg 단서 있으면 제거
-    - normalize된 값으로 dedup
+
+    [초엄격 정책]
+    - plausibility 통과
+    - ctx_score_account()가 0이 아니어야 함 (= POS>=1 & BANK>=1 & NEG=0)
+    - ctx_score_account() >= 0.78 (THRESH_ACCOUNT와 동일 기준으로 올림)
+    - normalize + dedup
+
+    => "관련 키워드 + 은행 단서"가 없으면 후보 리스트에 아예 들어가지 않음.
     """
     out: List[str] = []
     for c in raw_candidates or []:
         if not is_plausible_korean_account(c):
             continue
-        win = _window(doc_text, c, 140)
-        if _has_any(win, ACCOUNT_NEG_KWS):
-            continue
+
         sc = ctx_score_account(doc_text, c)
-        if sc < 0.60:
+        if sc <= 0.0:
             continue
+        if sc < THRESH_ACCOUNT:
+            continue
+
         s = normalize_digits_hyphen(c)
         if s and s not in out:
             out.append(s)
@@ -797,9 +817,8 @@ def llm_action_plan(
     acct_raw = tags.get("계좌", []) if tags else []
     has_sched = bool((schedule_iso or {}).get("start_date"))
 
-    # 계좌 후보는 "일단" 태그 기반 후보를 넘기되, 서버가 최종 재검증한다.
     phone_payload = [{"value": p, "context": _window(doc_text, p, 80)} for p in phone_cands]
-    acct_payload = [{"value": a, "context": _window(doc_text, a, 120)} for a in acct_raw]
+    acct_payload = [{"value": a, "context": _window(doc_text, a, 140)} for a in acct_raw]
 
     payload = {
         "doc_len": len((doc_text or "").strip()),
@@ -837,6 +856,7 @@ A) call:
 B) copy_account (매우 엄격):
   - 후보 주변 context에 반드시 아래 중 1개 이상이 있어야 한다:
       "계좌", "계좌번호", "가상계좌", "입금", "납부", "이체", "은행", "예금주"
+  - 그리고 "은행명/은행/뱅크" 단서도 반드시 있어야 한다.
   - 그리고 아래가 보이면 무조건 금지:
       "문서번호", "접수번호", "승인번호", "관리번호", "고객번호", "주문번호"
   - 단독 계좌 예외는 절대 금지(문맥 없으면 무조건 actions에서 제외)
@@ -897,17 +917,14 @@ def validate_and_build_actions(
     llm_plan: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    서버 최종 게이트(오탐 최소화) - STRICT ACCOUNT:
-    - 후보 범위 검증
-    - call: 문맥 점수/팩스-only 차단 + 제한적 단독 예외
-    - account: (1) plausibility (2) neg 단서 차단 (3) pos 단서 필수 (4) context_score 엄격
-    - calendar: 이벤트 단서/부정 단서/임계값
+    서버 최종 게이트(오탐 최소화) - STRICT ACCOUNT (초엄격):
+    - account: (1) plausibility (2) NEG 즉시 차단 (3) POS>=1 & BANK>=1 필수 (4) context_score >= THRESH_ACCOUNT
     """
     phone_cands = tags.get("전화번호", []) if tags else []
     acct_raw = tags.get("계좌", []) if tags else []
     has_sched = bool((schedule_iso or {}).get("start_date"))
 
-    # 계좌 후보를 서버에서 "엄격 재검증"한 리스트로 교체
+    # ✅ 계좌 후보를 서버에서 "초엄격 재검증"한 리스트로 교체
     acct_cands_strict = extract_account_candidates_strict(doc_text, acct_raw)
 
     actions_out: List[Dict[str, Any]] = []
@@ -957,34 +974,29 @@ def validate_and_build_actions(
             })
 
         elif atype == "copy_account":
-            # 엄격: 서버에서는 "strict 후보 리스트"만 인정
+            # ✅ 서버에서는 strict 후보 리스트가 비어 있으면 무조건 차단
             if not acct_cands_strict:
                 continue
+
+            # LLM pick은 acct_raw 인덱스 기반이므로 범위 검증
             if not isinstance(pick, int) or pick < 0 or pick >= len(acct_raw):
                 continue
 
             raw = acct_raw[pick]
             norm = normalize_digits_hyphen(raw)
-            if not norm or norm not in acct_cands_strict:
+            if not norm:
                 continue
 
-            win = _window(doc_text, raw, 140)
-
-            # neg 단서 있으면 즉시 차단
-            if _has_any(win, ACCOUNT_NEG_KWS):
+            # ✅ strict 후보에 포함된 것만 허용
+            if norm not in acct_cands_strict:
                 continue
 
-            # pos 단서 최소 1개 강제
-            must = _has_any(win, ACCOUNT_POS_KWS) or _has_any(doc_text, ["가상계좌", "계좌번호"])
-            if not must:
-                continue
-
+            # 추가 방어: 최종 컨텍스트 점수 재계산(0이면 즉시 컷)
             ctx = ctx_score_account(doc_text, raw)
+            if ctx < THRESH_ACCOUNT:
+                continue
 
-            # 매우 엄격: ctx가 높아야 함
             final_conf = min(conf if conf > 0 else 0.85, 0.95) * (0.60 + 0.40 * ctx)
-
-            # 단독 계좌 예외 금지
             if final_conf < THRESH_ACCOUNT:
                 continue
 
@@ -995,7 +1007,7 @@ def validate_and_build_actions(
                     "account": norm,
                     "source": "tags.계좌 (strict_recheck)",
                     "context_score": round(ctx, 3),
-                    "reason": (reason or "납부/계좌 단서")[:20],
+                    "reason": (reason or "계좌/은행 단서")[:20],
                 },
                 "confidence": round(final_conf, 3),
             })
@@ -1068,7 +1080,7 @@ def validate_and_build_actions(
             need_more_info = True
             ask_back = [
                 "이 번호/계좌가 실제로 '연락' 또는 '입금/납부' 용도 맞나요?",
-                "맞다면 '문의', '입금', '납부', '계좌번호', '가상계좌' 같은 단서가 있는 부분을 같이 알려주시면 정확도가 올라가요.",
+                "맞다면 '은행명/은행', '납부', '가상계좌', '계좌번호' 같은 단서가 있는 부분을 같이 알려주시면 정확도가 올라가요.",
             ]
 
     return {
