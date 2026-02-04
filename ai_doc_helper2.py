@@ -1,5 +1,10 @@
-#0204
-# ai_doc_helper2.py
+# 0204
+# 계좌 로직 업데이트:
+# - 계좌 UI 액션(copy_account)은 "계좌/가상계좌/납부/입금/은행/예금주" 등 강한 문맥이 있을 때만 허용
+# - 문서번호/접수번호/승인번호/관리번호 주변이면 무조건 차단
+# - 단독 계좌 예외(SINGLETON)는 계좌에 대해 완전 비활성화
+# - 계좌 후보는 서버에서 재검증(normalize + plausibility + context score) 후에만 버튼 생성
+# ai_doc_helper2_strict.py
 # Google Cloud Vision OCR + OpenAI GPT-4o-mini + gTTS
 
 from dotenv import load_dotenv
@@ -9,6 +14,7 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
+
 from PIL import Image, ImageDraw
 from google.cloud import vision
 from google.oauth2 import service_account
@@ -38,6 +44,10 @@ DEFAULT_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 KST_TZ = "Asia/Seoul"
 
 
+# ============================================================
+# Clients
+# ============================================================
+
 def build_vision_client(key_path: Optional[str] = None) -> vision.ImageAnnotatorClient:
     if key_path is None:
         key_path = DEFAULT_GCP_KEY
@@ -59,7 +69,10 @@ def build_openai_client(api_key: Optional[str] = None):
         return openai
 
 
+# ============================================================
 # OCR
+# ============================================================
+
 def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
     buf = io.BytesIO()
     img.save(buf, format=fmt)
@@ -89,9 +102,10 @@ def draw_boxes(pil_img: Image.Image, boxes: List[List[Tuple[int, int]]], stroke:
     return out
 
 
-# -----------------------------
+# ============================================================
 # Tag extraction (regex)
-# -----------------------------
+# ============================================================
+
 TAG_REGEX = {
     "날짜": [
         r"\b20\d{2}[./-]\d{1,2}[./-]\d{1,2}(?:\.)?(?:\([월화수목금토일]\))?\b",
@@ -106,6 +120,7 @@ TAG_REGEX = {
         r"\b0\d{1,2}-\d{3,4}-\d{4}\b",
         r"\b0\d{9,10}\b"
     ],
+    # 계좌는 "후보 추출"로만 쓰고, UI 버튼은 서버에서 재검증 + 문맥강제
     "계좌": [
         r"\b\d{2,3}-\d{2,6}-\d{2,6}-?\d{0,6}\b",
         r"\b계좌(?:번호)?\s*[:：]?\s*\d[\d-]{6,}\b"
@@ -148,13 +163,14 @@ def extract_tags(text: str) -> Dict[str, List[str]]:
     return {k: v for k, v in found.items() if v}
 
 
-# -----------------------------
+# ============================================================
 # Doc type
-# -----------------------------
+# ============================================================
+
 DOC_TYPES = {
     "정부·공공": ["지원금", "세금", "건강보험", "환급"],
     "의료": ["진단서", "혈압", "혈당", "검사", "병원"],
-    "금융": ["대출", "보험", "약관", "이자", "수수료"],
+    "금융": ["대출", "보험", "약관", "이자", "수수료", "납부", "입금", "가상계좌", "계좌번호"],
     "법률": ["계약서", "동의서", "조항"],
     "일상": ["고지서", "공고", "관리비"],
 }
@@ -178,9 +194,10 @@ def is_low_info(text: str, tags: Dict[str, List[str]]) -> bool:
     return len(tokens) < 10 and len(tags) == 0
 
 
-# -------------------------------------------------------------------
-# Schedule extraction (LEGACY: title/date_range/time_range)
-# -------------------------------------------------------------------
+# ============================================================
+# Schedule extraction (LEGACY)
+# ============================================================
+
 TIME_PAT = re.compile(
     r"(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?\s*(~|-|부터)\s*(오전|오후)?\s*\d{1,2}[:시]\s*\d{0,2}\s*(분)?"
 )
@@ -225,9 +242,9 @@ def extract_schedule(text: str) -> Dict[str, Optional[str]]:
     }
 
 
-# -------------------------------------------------------------------
+# ============================================================
 # ISO 8601 schedule_suggestion + LLM title
-# -------------------------------------------------------------------
+# ============================================================
 
 def _pad2(n: int) -> str:
     return f"{n:02d}"
@@ -282,6 +299,7 @@ def _parse_date_token(s: str, default_year: int) -> Optional[str]:
 
 RANGE_KEYWORDS = ["등록", "등록기간", "등록 기간", "문서 등록", "신청", "신청기간", "접수", "접수기간", "제출", "납부", "마감", "기한", "기간", "안내", "발표"]
 
+
 def _score_context(text: str, start: int, end: int) -> int:
     win = (text or "")[max(0, start - 80): min(len(text or ""), end + 80)]
     score = 0
@@ -304,7 +322,6 @@ def _pick_best_match(text: str, matches: List[re.Match]) -> Optional[re.Match]:
     return best
 
 
-# A: 한국어 날짜+시간 범위
 KO_DATE_TIME_RANGE_PAT = re.compile(
     r"(?:\b(20\d{2})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일(?:\([월화수목금토일]\))?\s*"
     r"(오전|오후)?\s*(\d{1,2})\s*[:시]\s*(\d{2})\s*(?:분)?\s*"
@@ -313,7 +330,6 @@ KO_DATE_TIME_RANGE_PAT = re.compile(
     r"(오전|오후)?\s*(\d{1,2})\s*[:시]\s*(\d{2})\s*(?:분)?\s*(?:까지)?"
 )
 
-# B: 숫자 날짜+시간 범위
 NUM_DATE_TIME_RANGE_PAT = re.compile(
     r"\b(20\d{2})[./-](\d{1,2})[./-](\d{1,2})(?:\.)?(?:\([월화수목금토일]\))?\s+"
     r"(\d{1,2})\s*:\s*(\d{2})\s*(?:~|-|부터)\s*"
@@ -321,16 +337,13 @@ NUM_DATE_TIME_RANGE_PAT = re.compile(
     r"(\d{1,2})\s*:\s*(\d{2})\b"
 )
 
-# C: 한 날짜 + 24h 시간 범위
 ONE_DATE_24H_TIME_RANGE_PAT = re.compile(
     r"\b(20\d{2}[./-]\d{1,2}[./-]\d{1,2}(?:\.)?(?:\([월화수목금토일]\))?)\s+"
     r"(\d{1,2})\s*:\s*(\d{2})\s*(?:~|-|부터)\s*(\d{1,2})\s*:\s*(\d{2})\b"
 )
 
-# D: 시간만 존재 (24h)
 TIME_24H_RANGE_PAT = re.compile(r"\b(\d{1,2})\s*:\s*(\d{2})\s*(?:~|-|부터)\s*(\d{1,2})\s*:\s*(\d{2})\b")
 
-# E: 오전/오후 시간 범위(분 생략 허용)
 KO_TIME_RANGE_PAT = re.compile(
     r"(오전|오후)?\s*(\d{1,2})(?:[:시]\s*(\d{1,2}))?\s*(?:분)?\s*(~|-|부터|까지)\s*"
     r"(오전|오후)?\s*(\d{1,2})(?:[:시]\s*(\d{1,2}))?\s*(?:분)?"
@@ -544,9 +557,10 @@ def extract_schedule_iso(text: str, client=None) -> Dict[str, Optional[object]]:
     }
 
 
-# -----------------------------
+# ============================================================
 # LLM summarization
-# -----------------------------
+# ============================================================
+
 PROMPT_TEMPLATE = """
 당신은 한국어 'AI 문서 해설사'입니다.
 입력 문서를 어르신이 이해하기 쉽게 요약(핵심,행동안내)으로 변환하세요.
@@ -560,7 +574,7 @@ PROMPT_TEMPLATE = """
 출력(JSON 형식):
 {{
   "bullets": ["핵심 3~5가지 요약"],
-  "next_actions": ["지금 해야 할 행동 1~2개"]
+  "next_actions": ["지금 해야 할 행동 1~2개"],
   "need_more_info": false,
   "ask_back": ["사용자에게 추가로 물어볼 질문 1~3개"]
 }}
@@ -596,15 +610,18 @@ def llm_summarize(doc_text: str, doc_type: str, client) -> Dict:
     try:
         data = json.loads(content)
     except Exception as e:
-        data = {"bullets": [f"요약 오류: {e}"], "next_actions": []}
+        data = {"bullets": [f"요약 오류: {e}"], "next_actions": [], "need_more_info": True, "ask_back": []}
     data.setdefault("bullets", [])
     data.setdefault("next_actions", [])
+    data.setdefault("need_more_info", False)
+    data.setdefault("ask_back", [])
     return data
 
 
-# -----------------------------
+# ============================================================
 # TTS
-# -----------------------------
+# ============================================================
+
 def tts_bytes_ko(text: str) -> bytes:
     txt = (text or "").strip() or "읽을 내용이 없습니다. 다시 시도해 주세요."
     tts = gTTS(text=txt, lang="ko")
@@ -614,27 +631,37 @@ def tts_bytes_ko(text: str) -> bytes:
 
 
 # ============================================================
-# Action Planning (오탐 최소화 정책)
+# Action Planning (오탐 최소화 정책) - STRICT ACCOUNT
 # ============================================================
 
 ACTION_TYPES = ["call", "copy_account", "create_calendar"]
 
 CALL_HINTS = ["문의", "연락", "전화", "고객센터", "대표번호", "콜센터", "상담", "ARS", "내선", "FAX", "팩스"]
-ACCOUNT_HINTS = ["입금", "송금", "납부", "계좌", "계좌번호", "무통장", "가상계좌", "은행", "예금주", "수취", "이체"]
 CAL_EVENT_HINTS = ["등록", "신청", "접수", "제출", "납부", "마감", "기한", "기간", "예약", "검사", "면접", "설명회", "오리엔테이션"]
-CAL_NEG_HINTS = ["발행", "발급", "작성", "출력", "고지", "청구"]  # 단독 날짜 오탐을 줄이기 위한 부정 단서
+CAL_NEG_HINTS = ["발행", "발급", "작성", "출력", "고지", "청구"]
 
-# 오탐 최소화: 기본 임계값(보수적)
+# 계좌 관련: "엄격" (문맥 강제)
+ACCOUNT_POS_KWS = ["계좌", "계좌번호", "가상계좌", "입금", "송금", "납부", "이체", "은행", "예금주", "수취"]
+ACCOUNT_NEG_KWS = ["문서번호", "접수번호", "승인번호", "관리번호", "고객번호", "주문번호", "운송장", "송장", "청구번호"]
+BANK_KWS = [
+    "국민", "신한", "우리", "하나", "농협", "기업", "카카오뱅크", "토스뱅크",
+    "새마을", "우체국", "수협", "대구", "부산", "광주", "전북", "경남", "SC", "씨티"
+]
+
+# 오탐 최소화: 기본 임계값
 THRESH_CALL = 0.60
-THRESH_ACCOUNT = 0.60
+THRESH_ACCOUNT = 0.78   # 엄격하게 올림
 THRESH_CAL = 0.70
 
-# 단독 값 예외(문맥 거의 없을 때) - 매우 제한적으로만 허용
-# (전화/계좌만 덩그러니 있을 수 있다는 요구 반영)
-ENABLE_SINGLETON_EXCEPTION = True
-SINGLETON_MAX_LEN = 180  # 텍스트가 이 정도 이하로 짧을 때만 예외 허용
-SINGLETON_CONF_MAX = 0.55  # 예외로 통과해도 이 이상은 주지 않음
-SINGLETON_MIN = 0.45  # 예외 허용 하한
+# 단독 값 예외:
+# - 전화는 "단독 전화" 예외를 제한적으로 허용 가능
+# - 계좌는 단독 예외 완전 금지(엄격 버전 핵심)
+ENABLE_SINGLETON_EXCEPTION_CALL = True
+ENABLE_SINGLETON_EXCEPTION_ACCOUNT = False
+
+SINGLETON_MAX_LEN = 180
+SINGLETON_CONF_MAX = 0.55
+SINGLETON_MIN = 0.45
 
 
 def _window(text: str, token: str, radius: int = 80) -> str:
@@ -644,6 +671,11 @@ def _window(text: str, token: str, radius: int = 80) -> str:
     if idx == -1:
         return ""
     return text[max(0, idx - radius): min(len(text), idx + len(token) + radius)]
+
+
+def _has_any(text: str, kws: List[str]) -> bool:
+    t = text or ""
+    return any(k in t for k in kws)
 
 
 def _ctx_score(text: str, token: str, hints: List[str]) -> float:
@@ -657,9 +689,69 @@ def _ctx_score(text: str, token: str, hints: List[str]) -> float:
     return min(1.0, score / 4.0)
 
 
-def _has_any(text: str, kws: List[str]) -> bool:
-    t = text or ""
-    return any(k in t for k in kws)
+def normalize_digits_hyphen(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"[^\d-]", "", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s
+
+
+def is_plausible_korean_account(raw: str) -> bool:
+    """
+    계좌형식 1차 필터 (보수적):
+    - 하이픈 포함
+    - 전체 숫자 길이 9~16
+    - 파트 최소 길이 2 이상
+    """
+    s = normalize_digits_hyphen(raw)
+    if "-" not in s:
+        return False
+    digits = re.sub(r"-", "", s)
+    if not (9 <= len(digits) <= 16):
+        return False
+    parts = s.split("-")
+    if any(len(p) < 2 for p in parts):
+        return False
+    return True
+
+
+def ctx_score_account(text: str, token: str) -> float:
+    win = _window(text, token, radius=120)
+    if not win:
+        return 0.0
+    pos = sum(1 for k in ACCOUNT_POS_KWS if k in win)
+    bank = sum(1 for k in BANK_KWS if k in win)
+    neg = sum(1 for k in ACCOUNT_NEG_KWS if k in win)
+
+    # 보수적 가중
+    score = 0.0
+    score += min(1.0, pos / 3.0) * 0.75
+    score += min(1.0, bank / 1.0) * 0.25
+    score -= min(1.0, neg / 1.0) * 0.95
+    return max(0.0, min(1.0, score))
+
+
+def extract_account_candidates_strict(doc_text: str, raw_candidates: List[str]) -> List[str]:
+    """
+    tags의 '계좌' 후보를 그대로 쓰지 않고 서버에서 재검증.
+    - plausibility 통과 + context_score >= 0.60
+    - neg 단서 있으면 제거
+    - normalize된 값으로 dedup
+    """
+    out: List[str] = []
+    for c in raw_candidates or []:
+        if not is_plausible_korean_account(c):
+            continue
+        win = _window(doc_text, c, 140)
+        if _has_any(win, ACCOUNT_NEG_KWS):
+            continue
+        sc = ctx_score_account(doc_text, c)
+        if sc < 0.60:
+            continue
+        s = normalize_digits_hyphen(c)
+        if s and s not in out:
+            out.append(s)
+    return out
 
 
 def _safe_json_load(s: str) -> Optional[Dict[str, Any]]:
@@ -677,6 +769,18 @@ def _safe_json_load(s: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _singleton_exception_ok_call(doc_text: str, phone_cands: List[str], has_sched: bool) -> bool:
+    if not ENABLE_SINGLETON_EXCEPTION_CALL:
+        return False
+    txt = (doc_text or "").strip()
+    if len(txt) > SINGLETON_MAX_LEN:
+        return False
+    num_tokens = re.findall(r"\d{3,}", txt)
+    if len(num_tokens) >= 6:
+        return False
+    return (len(phone_cands) == 1) and (not has_sched)
+
+
 def llm_action_plan(
     doc_text: str,
     tags: Dict[str, List[str]],
@@ -684,25 +788,25 @@ def llm_action_plan(
     client
 ) -> Dict[str, Any]:
     """
-    오탐 최소화 프롬프트:
+    오탐 최소화 프롬프트 (엄격 계좌 버전):
     - 후보 리스트에서 pick만 가능
-    - 단독 전화/계좌는 제한적 예외 허용(낮은 confidence)
-    - 캘린더는 문맥 단서 없으면 거의 금지
+    - 계좌는 '강한 문맥'이 있을 때만 허용(LLM에게도 강제)
+    - 캘린더는 이벤트 단서 없으면 금지
     """
     phone_cands = tags.get("전화번호", []) if tags else []
-    acct_cands = tags.get("계좌", []) if tags else []
+    acct_raw = tags.get("계좌", []) if tags else []
     has_sched = bool((schedule_iso or {}).get("start_date"))
 
-    # 후보별 context_window를 같이 제공 -> 모델이 근거 판단을 더 안정적으로
+    # 계좌 후보는 "일단" 태그 기반 후보를 넘기되, 서버가 최종 재검증한다.
     phone_payload = [{"value": p, "context": _window(doc_text, p, 80)} for p in phone_cands]
-    acct_payload = [{"value": a, "context": _window(doc_text, a, 80)} for a in acct_cands]
+    acct_payload = [{"value": a, "context": _window(doc_text, a, 120)} for a in acct_raw]
 
     payload = {
         "doc_len": len((doc_text or "").strip()),
         "phone_candidates": phone_payload,
         "account_candidates": acct_payload,
         "schedule_candidate": schedule_iso if has_sched else None,
-        "doc_text_snippet": (doc_text or "")[:800],  # 너무 길게 주지 않음
+        "doc_text_snippet": (doc_text or "")[:900],
     }
 
     prompt = f"""
@@ -720,36 +824,32 @@ def llm_action_plan(
 - "copy_account" (account_candidates에서 pick=int)
 - "create_calendar" (pick="schedule"; schedule_candidate가 있을 때만)
 
-판단 규칙(오탐 최소화):
+판단 규칙(엄격):
 A) call:
-  - 후보 주변 context에 "문의/연락/고객센터/대표번호/상담/ARS/FAX" 같은 단서가 있으면 허용(고신뢰)
-  - 단서가 거의 없으면 기본적으로 금지하되,
-    '단독 전화 예외'만 허용 가능:
+  - 후보 주변 context에 "문의/연락/고객센터/대표번호/상담/ARS/FAX" 단서가 있으면 허용(고신뢰)
+  - 단서가 거의 없으면 금지하되,
+    '단독 전화 예외'만 매우 제한적으로 허용:
       * phone 후보가 정확히 1개
       * 문서가 매우 짧음(doc_len <= {SINGLETON_MAX_LEN})
-      * account 후보가 0개
-      * schedule_candidate가 없거나 빈약
-    => 이때만 confidence 0.45~0.55로 call 허용
+      * schedule_candidate가 없음
+    => 이때만 confidence 0.45~0.55
 
-B) copy_account:
-  - 후보 주변 context에 "입금/납부/가상계좌/은행/예금주" 단서가 있으면 허용(고신뢰)
-  - 단서가 거의 없으면 기본적으로 금지하되,
-    '단독 계좌 예외'만 허용 가능:
-      * account 후보가 정확히 1개
-      * 문서가 매우 짧음(doc_len <= {SINGLETON_MAX_LEN})
-      * phone 후보가 0개
-    => 이때만 confidence 0.45~0.55로 copy_account 허용
+B) copy_account (매우 엄격):
+  - 후보 주변 context에 반드시 아래 중 1개 이상이 있어야 한다:
+      "계좌", "계좌번호", "가상계좌", "입금", "납부", "이체", "은행", "예금주"
+  - 그리고 아래가 보이면 무조건 금지:
+      "문서번호", "접수번호", "승인번호", "관리번호", "고객번호", "주문번호"
+  - 단독 계좌 예외는 절대 금지(문맥 없으면 무조건 actions에서 제외)
 
 C) create_calendar:
   - schedule_candidate가 있어도, "등록/신청/접수/제출/납부/마감/예약/면접" 같은 이벤트 단서가 보일 때만 허용.
-  - 단독 날짜(발행일/고지일/작성일처럼 보이는 것)는 금지.
-  - 확신이 약하면 금지.
+  - 단독 날짜(발행/고지/작성일)는 금지.
 
 출력(JSON만):
 {{
   "actions":[
     {{"type":"call","pick":0,"confidence":0.8,"reason":"고객센터 단서"}},
-    {{"type":"copy_account","pick":0,"confidence":0.5,"reason":"단독 계좌 예외"}}
+    {{"type":"copy_account","pick":0,"confidence":0.8,"reason":"납부/가상계좌"}}
   ],
   "need_more_info": false,
   "ask_back": []
@@ -790,36 +890,6 @@ C) create_calendar:
     return data
 
 
-def _singleton_exception_ok(
-    doc_text: str,
-    phone_cands: List[str],
-    acct_cands: List[str],
-    has_sched: bool,
-    target: str
-) -> bool:
-    """
-    문맥 없는 단독 값 예외를 서버에서 최종 승인.
-    오탐 최소화를 위해 매우 엄격히 제한한다.
-    """
-    if not ENABLE_SINGLETON_EXCEPTION:
-        return False
-    txt = (doc_text or "").strip()
-    if len(txt) > SINGLETON_MAX_LEN:
-        return False
-
-    # 다른 숫자 정보가 너무 많으면(잡다한 번호들) 예외 금지
-    # "숫자 덩어리"가 많으면 단독 전화/계좌로 확정하기 위험
-    num_tokens = re.findall(r"\d{3,}", txt)
-    if len(num_tokens) >= 6:
-        return False
-
-    if target == "call":
-        return (len(phone_cands) == 1) and (len(acct_cands) == 0) and (not has_sched)
-    if target == "copy_account":
-        return (len(acct_cands) == 1) and (len(phone_cands) == 0) and (not has_sched)
-    return False
-
-
 def validate_and_build_actions(
     doc_text: str,
     tags: Dict[str, List[str]],
@@ -827,14 +897,18 @@ def validate_and_build_actions(
     llm_plan: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    서버 최종 게이트(오탐 최소화):
+    서버 최종 게이트(오탐 최소화) - STRICT ACCOUNT:
     - 후보 범위 검증
-    - 문맥 점수/부정 단서/임계값으로 최종 승인
-    - 단독 전화/계좌 예외는 서버에서만 승인(LLM 말만 믿지 않음)
+    - call: 문맥 점수/팩스-only 차단 + 제한적 단독 예외
+    - account: (1) plausibility (2) neg 단서 차단 (3) pos 단서 필수 (4) context_score 엄격
+    - calendar: 이벤트 단서/부정 단서/임계값
     """
     phone_cands = tags.get("전화번호", []) if tags else []
-    acct_cands = tags.get("계좌", []) if tags else []
+    acct_raw = tags.get("계좌", []) if tags else []
     has_sched = bool((schedule_iso or {}).get("start_date"))
+
+    # 계좌 후보를 서버에서 "엄격 재검증"한 리스트로 교체
+    acct_cands_strict = extract_account_candidates_strict(doc_text, acct_raw)
 
     actions_out: List[Dict[str, Any]] = []
     raw_actions = (llm_plan or {}).get("actions", []) or []
@@ -856,20 +930,15 @@ def validate_and_build_actions(
             phone = phone_cands[pick]
             ctx = _ctx_score(doc_text, phone, CALL_HINTS)
 
-            # 부정 단서: 팩스만 있고 전화 의미가 약하면 보수적
-            # (FAX도 전화번호처럼 보여서 오탐 가능)
-            win = _window(doc_text, phone, 90)
+            win = _window(doc_text, phone, 100)
             only_faxish = ("FAX" in win or "팩스" in win) and (not _has_any(win, ["문의", "연락", "고객센터", "상담", "대표번호", "전화"]))
             if only_faxish:
-                # 오탐 최소화: 팩스 전용이면 call 금지
                 continue
 
-            # 기본 승인: (LLM conf & 문맥)
             final_conf = min(conf, 0.95) * (0.55 + 0.45 * ctx)
 
-            # 단독 예외: 문맥이 거의 없어도 조건 만족 시 제한 승인
             if final_conf < THRESH_CALL:
-                if _singleton_exception_ok(doc_text, phone_cands, acct_cands, has_sched, target="call"):
+                if _singleton_exception_ok_call(doc_text, phone_cands, has_sched):
                     final_conf = max(SINGLETON_MIN, min(SINGLETON_CONF_MAX, max(final_conf, 0.50)))
                     reason = reason or "단독 전화 예외"
                 else:
@@ -888,34 +957,45 @@ def validate_and_build_actions(
             })
 
         elif atype == "copy_account":
-            if not acct_cands or not isinstance(pick, int) or pick < 0 or pick >= len(acct_cands):
+            # 엄격: 서버에서는 "strict 후보 리스트"만 인정
+            if not acct_cands_strict:
                 continue
-            acct = acct_cands[pick]
-            ctx = _ctx_score(doc_text, acct, ACCOUNT_HINTS)
-
-            # 부정 단서: '문서번호/승인번호/접수번호' 주변이면 계좌 오탐 가능
-            win = _window(doc_text, acct, 90)
-            if _has_any(win, ["문서번호", "승인번호", "접수번호", "관리번호", "고객번호"]):
-                # 오탐 최소화: 이런 문맥이면 계좌 버튼 금지
+            if not isinstance(pick, int) or pick < 0 or pick >= len(acct_raw):
                 continue
 
-            final_conf = min(conf, 0.95) * (0.55 + 0.45 * ctx)
+            raw = acct_raw[pick]
+            norm = normalize_digits_hyphen(raw)
+            if not norm or norm not in acct_cands_strict:
+                continue
 
+            win = _window(doc_text, raw, 140)
+
+            # neg 단서 있으면 즉시 차단
+            if _has_any(win, ACCOUNT_NEG_KWS):
+                continue
+
+            # pos 단서 최소 1개 강제
+            must = _has_any(win, ACCOUNT_POS_KWS) or _has_any(doc_text, ["가상계좌", "계좌번호"])
+            if not must:
+                continue
+
+            ctx = ctx_score_account(doc_text, raw)
+
+            # 매우 엄격: ctx가 높아야 함
+            final_conf = min(conf if conf > 0 else 0.85, 0.95) * (0.60 + 0.40 * ctx)
+
+            # 단독 계좌 예외 금지
             if final_conf < THRESH_ACCOUNT:
-                if _singleton_exception_ok(doc_text, phone_cands, acct_cands, has_sched, target="copy_account"):
-                    final_conf = max(SINGLETON_MIN, min(SINGLETON_CONF_MAX, max(final_conf, 0.50)))
-                    reason = reason or "단독 계좌 예외"
-                else:
-                    continue
+                continue
 
             actions_out.append({
                 "type": "copy_account",
                 "label": "계좌 복사",
                 "evidence": {
-                    "account": acct,
-                    "source": "tags.계좌",
+                    "account": norm,
+                    "source": "tags.계좌 (strict_recheck)",
                     "context_score": round(ctx, 3),
-                    "reason": reason[:20],
+                    "reason": (reason or "납부/계좌 단서")[:20],
                 },
                 "confidence": round(final_conf, 3),
             })
@@ -926,9 +1006,6 @@ def validate_and_build_actions(
             if pick != "schedule":
                 continue
 
-            # 캘린더는 오탐이 치명적이라서 매우 엄격:
-            # - 문서에 이벤트 단서가 있어야 함
-            # - 부정 단서(발행/고지/작성)만 있으면 금지
             txt = doc_text or ""
             has_pos = _has_any(txt, CAL_EVENT_HINTS)
             has_neg = _has_any(txt, CAL_NEG_HINTS)
@@ -938,15 +1015,12 @@ def validate_and_build_actions(
             if has_neg and not _has_any(txt, ["마감", "기한", "까지", "신청", "접수", "등록", "예약"]):
                 continue
 
-            # schedule title이 비어 있으면(근거 약함) 더 보수적으로
             title = (schedule_iso or {}).get("title") or ""
             base = 0.80 if title else 0.72
-            # 키워드 개수 기반 ctx
             hit = sum(1 for k in CAL_EVENT_HINTS if k in txt)
             ctx = min(1.0, hit / 6.0)
 
             final_conf = min(conf if conf > 0 else 0.85, 0.95) * (base + 0.2 * ctx)
-
             if final_conf < THRESH_CAL:
                 continue
 
@@ -984,19 +1058,17 @@ def validate_and_build_actions(
     ask_back: List[str] = []
 
     if len(actions_final) == 0:
-        # 후보 자체가 없으면 정보 부족
-        if (not phone_cands) and (not acct_cands) and (not has_sched):
+        if (not phone_cands) and (not acct_raw) and (not has_sched):
             need_more_info = True
             ask_back = [
                 "이 문서에서 하려는 일이 '전화', '입금/납부', '일정 추가' 중 무엇인가요?",
                 "가능하면 문서의 핵심 문장을 한 줄만 알려주세요.",
             ]
         else:
-            # 후보는 있으나 오탐 방지를 위해 모두 막힌 케이스
             need_more_info = True
             ask_back = [
                 "이 번호/계좌가 실제로 '연락' 또는 '입금/납부' 용도 맞나요?",
-                "맞다면 '문의', '입금', '납부', '마감' 같은 단서가 있는 부분을 같이 알려주시면 정확도가 올라가요.",
+                "맞다면 '문의', '입금', '납부', '계좌번호', '가상계좌' 같은 단서가 있는 부분을 같이 알려주시면 정확도가 올라가요.",
             ]
 
     return {
@@ -1006,9 +1078,10 @@ def validate_and_build_actions(
     }
 
 
-# -----------------------------
+# ============================================================
 # Pipeline
-# -----------------------------
+# ============================================================
+
 def process_image_bytes(
     image_bytes: bytes,
     gcp_key: Optional[str] = None,
@@ -1056,7 +1129,8 @@ def process_image_bytes(
         # action이 need_more_info면 summary에도 질문을 합쳐 UX 일관성 유지
         if action_pack.get("need_more_info") and not summary.get("need_more_info"):
             summary["need_more_info"] = True
-        merged = []
+
+        merged: List[str] = []
         for q in (summary.get("ask_back", []) or []) + (action_pack.get("ask_back", []) or []):
             q = (q or "").strip()
             if q and q not in merged:
